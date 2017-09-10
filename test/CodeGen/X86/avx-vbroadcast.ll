@@ -831,6 +831,44 @@ define <4 x double> @splat_concat4(double* %p) {
   ret <4 x double> %6
 }
 
+; PR34041
+define <4 x double> @broadcast_shuffle_1000(double* %p) {
+; X32-LABEL: broadcast_shuffle_1000:
+; X32:       ## BB#0:
+; X32-NEXT:    movl {{[0-9]+}}(%esp), %eax
+; X32-NEXT:    vbroadcastsd (%eax), %ymm0
+; X32-NEXT:    retl
+;
+; X64-LABEL: broadcast_shuffle_1000:
+; X64:       ## BB#0:
+; X64-NEXT:    vbroadcastsd (%rdi), %ymm0
+; X64-NEXT:    retq
+  %1 = load double, double* %p
+  %2 = insertelement <2 x double> undef, double %1, i32 0
+  %3 = shufflevector <2 x double> %2, <2 x double> undef, <4 x i32> <i32 1, i32 0, i32 0, i32 0>
+  ret <4 x double> %3
+}
+
+define <4 x double> @broadcast_shuffle1032(double* %p) {
+; X32-LABEL: broadcast_shuffle1032:
+; X32:       ## BB#0:
+; X32-NEXT:    movl {{[0-9]+}}(%esp), %eax
+; X32-NEXT:    vmovddup {{.*#+}} xmm0 = mem[0,0]
+; X32-NEXT:    vinsertf128 $1, %xmm0, %ymm0, %ymm0
+; X32-NEXT:    retl
+;
+; X64-LABEL: broadcast_shuffle1032:
+; X64:       ## BB#0:
+; X64-NEXT:    vmovddup {{.*#+}} xmm0 = mem[0,0]
+; X64-NEXT:    vinsertf128 $1, %xmm0, %ymm0, %ymm0
+; X64-NEXT:    retq
+  %1 = load double, double* %p
+  %2 = insertelement <2 x double> undef, double %1, i32 1
+  %3 = insertelement <2 x double> undef, double %1, i32 0
+  %4 = shufflevector <2 x double> %2, <2 x double> %3, <4 x i32> <i32 1, i32 0, i32 3, i32 2>
+  ret <4 x double> %4
+}
+
 ;
 ; When VBROADCAST replaces an existing load, ensure it still respects lifetime dependencies.
 ;
@@ -878,15 +916,15 @@ define float @broadcast_lifetime() nounwind {
   %3 = bitcast <4 x float>* %1 to i8*
   %4 = bitcast <4 x float>* %2 to i8*
 
-  call void @llvm.lifetime.start(i64 16, i8* %3)
+  call void @llvm.lifetime.start.p0i8(i64 16, i8* %3)
   call void @gfunc(<4 x float>* %1)
   %5 = load <4 x float>, <4 x float>* %1, align 16
-  call void @llvm.lifetime.end(i64 16, i8* %3)
+  call void @llvm.lifetime.end.p0i8(i64 16, i8* %3)
 
-  call void @llvm.lifetime.start(i64 16, i8* %4)
+  call void @llvm.lifetime.start.p0i8(i64 16, i8* %4)
   call void @gfunc(<4 x float>* %2)
   %6 = load <4 x float>, <4 x float>* %2, align 16
-  call void @llvm.lifetime.end(i64 16, i8* %4)
+  call void @llvm.lifetime.end.p0i8(i64 16, i8* %4)
 
   %7 = extractelement <4 x float> %5, i32 1
   %8 = extractelement <4 x float> %6, i32 1
@@ -895,5 +933,5 @@ define float @broadcast_lifetime() nounwind {
 }
 
 declare void @gfunc(<4 x float>*)
-declare void @llvm.lifetime.start(i64, i8*)
-declare void @llvm.lifetime.end(i64, i8*)
+declare void @llvm.lifetime.start.p0i8(i64, i8*)
+declare void @llvm.lifetime.end.p0i8(i64, i8*)

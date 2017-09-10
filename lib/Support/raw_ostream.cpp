@@ -326,13 +326,30 @@ raw_ostream &raw_ostream::operator<<(const formatv_object_base &Obj) {
 }
 
 raw_ostream &raw_ostream::operator<<(const FormattedString &FS) {
-  unsigned Len = FS.Str.size(); 
-  int PadAmount = FS.Width - Len;
-  if (FS.RightJustify && (PadAmount > 0))
+  if (FS.Str.size() >= FS.Width || FS.Justify == FormattedString::JustifyNone) {
+    this->operator<<(FS.Str);
+    return *this;
+  }
+  const size_t Difference = FS.Width - FS.Str.size();
+  switch (FS.Justify) {
+  case FormattedString::JustifyLeft:
+    this->operator<<(FS.Str);
+    this->indent(Difference);
+    break;
+  case FormattedString::JustifyRight:
+    this->indent(Difference);
+    this->operator<<(FS.Str);
+    break;
+  case FormattedString::JustifyCenter: {
+    int PadAmount = Difference / 2;
     this->indent(PadAmount);
-  this->operator<<(FS.Str);
-  if (!FS.RightJustify && (PadAmount > 0))
-    this->indent(PadAmount);
+    this->operator<<(FS.Str);
+    this->indent(Difference - PadAmount);
+    break;
+  }
+  default:
+    llvm_unreachable("Bad Justification");
+  }
   return *this;
 }
 
@@ -465,15 +482,14 @@ void format_object_base::home() {
 static int getFD(StringRef Filename, std::error_code &EC,
                  sys::fs::OpenFlags Flags) {
   // Handle "-" as stdout. Note that when we do this, we consider ourself
-  // the owner of stdout. This means that we can do things like close the
-  // file descriptor when we're done and set the "binary" flag globally.
+  // the owner of stdout and may set the "binary" flag globally based on Flags.
   if (Filename == "-") {
     EC = std::error_code();
     // If user requested binary then put stdout into binary mode if
     // possible.
     if (!(Flags & sys::fs::F_Text))
       sys::ChangeStdoutToBinary();
-    return dup(STDOUT_FILENO);
+    return STDOUT_FILENO;
   }
 
   int FD;
@@ -497,6 +513,15 @@ raw_fd_ostream::raw_fd_ostream(int fd, bool shouldClose, bool unbuffered)
     ShouldClose = false;
     return;
   }
+
+  // Do not attempt to close stdout or stderr. We used to try to maintain the
+  // property that tools that support writing file to stdout should not also
+  // write informational output to stdout, but in practice we were never able to
+  // maintain this invariant. Many features have been added to LLVM and clang
+  // (-fdump-record-layouts, optimization remarks, etc) that print to stdout, so
+  // users must simply be aware that mixed output and remarks is a possibility.
+  if (FD <= STDERR_FILENO)
+    ShouldClose = false;
 
   // Get the starting position.
   off_t loc = ::lseek(FD, 0, SEEK_CUR);
@@ -542,7 +567,11 @@ void raw_fd_ostream::write_impl(const char *Ptr, size_t Size) {
   pos += Size;
 
 #ifndef LLVM_ON_WIN32
+#if defined(__linux__)
+  bool ShouldWriteInChunks = true;
+#else
   bool ShouldWriteInChunks = false;
+#endif
 #else
   // Writing a large size of output to Windows console returns ENOMEM. It seems
   // that, prior to Windows 8, WriteFile() is redirecting to WriteConsole(), and
@@ -695,10 +724,7 @@ bool raw_fd_ostream::has_colors() const {
 /// outs() - This returns a reference to a raw_ostream for standard output.
 /// Use it like: outs() << "foo" << "bar";
 raw_ostream &llvm::outs() {
-  // Set buffer settings to model stdout behavior.  Delete the file descriptor
-  // when the program exits, forcing error detection.  This means that if you
-  // ever call outs(), you can't open another raw_fd_ostream on stdout, as we'll
-  // close stdout twice and print an error the second time.
+  // Set buffer settings to model stdout behavior.
   std::error_code EC;
   static raw_fd_ostream S("-", EC, sys::fs::F_None);
   assert(!EC);

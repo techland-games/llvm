@@ -184,6 +184,10 @@ class InstrItineraryData;
       SMLALBT,      // 64-bit signed accumulate multiply bottom, top 16
       SMLALTB,      // 64-bit signed accumulate multiply top, bottom 16
       SMLALTT,      // 64-bit signed accumulate multiply top, top 16
+      SMLALD,       // Signed multiply accumulate long dual
+      SMLALDX,      // Signed multiply accumulate long dual exchange
+      SMLSLD,       // Signed multiply subtract long dual
+      SMLSLDX,      // Signed multiply subtract long dual exchange
 
       // Operands of the standard BUILD_VECTOR node are not legalized, which
       // is fine if BUILD_VECTORs are always lowered to shuffles or other
@@ -271,6 +275,8 @@ class InstrItineraryData;
       return (Kind != ScalarCondVectorVal);
     }
 
+    bool isReadOnly(const GlobalValue *GV) const;
+
     /// getSetCCResultType - Return the value type to use for ISD::SETCC.
     EVT getSetCCResultType(const DataLayout &DL, LLVMContext &Context,
                            EVT VT) const override;
@@ -313,7 +319,8 @@ class InstrItineraryData;
     /// isLegalAddressingMode - Return true if the addressing mode represented
     /// by AM is legal for this target, for a load/store of the specified type.
     bool isLegalAddressingMode(const DataLayout &DL, const AddrMode &AM,
-                               Type *Ty, unsigned AS) const override;
+                               Type *Ty, unsigned AS,
+                               Instruction *I = nullptr) const override;
 
     /// getScalingFactorCost - Return the cost of the scaling used in
     /// addressing mode represented by AM.
@@ -323,6 +330,10 @@ class InstrItineraryData;
                              unsigned AS) const override;
 
     bool isLegalT2ScaledAddressingMode(const AddrMode &AM, EVT VT) const;
+
+    /// \brief Returns true if the addresing mode representing by AM is legal
+    /// for the Thumb1 target, for a load/store of the specified type.
+    bool isLegalT1ScaledAddressingMode(const AddrMode &AM, EVT VT) const;
 
     /// isLegalICmpImmediate - Return true if the specified immediate is legal
     /// icmp immediate, that is the target has icmp instructions which can
@@ -350,8 +361,8 @@ class InstrItineraryData;
                                     SDValue &Offset, ISD::MemIndexedMode &AM,
                                     SelectionDAG &DAG) const override;
 
-    void computeKnownBitsForTargetNode(const SDValue Op, APInt &KnownZero,
-                                       APInt &KnownOne,
+    void computeKnownBitsForTargetNode(const SDValue Op, KnownBits &Known,
+                                       const APInt &DemandedElts,
                                        const SelectionDAG &DAG,
                                        unsigned Depth) const override;
 
@@ -435,7 +446,7 @@ class InstrItineraryData;
     Sched::Preference getSchedulingPreference(SDNode *N) const override;
 
     bool
-    isShuffleMaskLegal(const SmallVectorImpl<int> &M, EVT VT) const override;
+    isShuffleMaskLegal(ArrayRef<int> M, EVT VT) const override;
     bool isOffsetFoldingLegal(const GlobalAddressSDNode *GA) const override;
 
     /// isFPImmLegal - Returns true if the target can instruction select the
@@ -454,7 +465,8 @@ class InstrItineraryData;
 
     /// Return true if EXTRACT_SUBVECTOR is cheap for this result type
     /// with this index.
-    bool isExtractSubvectorCheap(EVT ResVT, unsigned Index) const override;
+    bool isExtractSubvectorCheap(EVT ResVT, EVT SrcVT,
+                                 unsigned Index) const override;
 
     /// \brief Returns true if an argument of type Ty needs to be passed in a
     /// contiguous block of registers in calling convention CallConv.
@@ -479,10 +491,10 @@ class InstrItineraryData;
 
     void emitAtomicCmpXchgNoStoreLLBalance(IRBuilder<> &Builder) const override;
 
-    Instruction* emitLeadingFence(IRBuilder<> &Builder, AtomicOrdering Ord,
-                          bool IsStore, bool IsLoad) const override;
-    Instruction* emitTrailingFence(IRBuilder<> &Builder, AtomicOrdering Ord,
-                           bool IsStore, bool IsLoad) const override;
+    Instruction *emitLeadingFence(IRBuilder<> &Builder, Instruction *Inst,
+                                  AtomicOrdering Ord) const override;
+    Instruction *emitTrailingFence(IRBuilder<> &Builder, Instruction *Inst,
+                                   AtomicOrdering Ord) const override;
 
     unsigned getMaxSupportedInterleaveFactor() const override { return 4; }
 
@@ -506,13 +518,18 @@ class InstrItineraryData;
     bool canCombineStoreAndExtract(Type *VectorTy, Value *Idx,
                                    unsigned &Cost) const override;
 
-    bool canMergeStoresTo(EVT MemVT) const override {
+    bool canMergeStoresTo(unsigned AddressSpace, EVT MemVT,
+                          const SelectionDAG &DAG) const override {
       // Do not merge to larger than i32.
       return (MemVT.getSizeInBits() <= 32);
     }
 
     bool isCheapToSpeculateCttz() const override;
     bool isCheapToSpeculateCtlz() const override;
+
+    bool convertSetCCLogicToBitwiseLogic(EVT VT) const override {
+      return VT.isScalarInteger();
+    }
 
     bool supportSwiftError() const override {
       return true;
@@ -524,6 +541,19 @@ class InstrItineraryData;
 
     CCAssignFn *CCAssignFnForCall(CallingConv::ID CC, bool isVarArg) const;
     CCAssignFn *CCAssignFnForReturn(CallingConv::ID CC, bool isVarArg) const;
+
+    /// Returns true if \p VecTy is a legal interleaved access type. This
+    /// function checks the vector element type and the overall width of the
+    /// vector.
+    bool isLegalInterleavedAccessType(VectorType *VecTy,
+                                      const DataLayout &DL) const;
+
+    /// Returns the number of interleaved accesses that will be generated when
+    /// lowering accesses of the given type.
+    unsigned getNumInterleavedAccesses(VectorType *VecTy,
+                                       const DataLayout &DL) const;
+
+    void finalizeLowering(MachineFunction &MF) const override;
 
   protected:
     std::pair<const TargetRegisterClass *, uint8_t>
@@ -580,6 +610,8 @@ class InstrItineraryData;
     SDValue LowerINTRINSIC_WO_CHAIN(SDValue Op, SelectionDAG &DAG,
                                     const ARMSubtarget *Subtarget) const;
     SDValue LowerBlockAddress(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerConstantPool(SDValue Op, SelectionDAG &DAG) const;
+    SDValue LowerGlobalAddress(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerGlobalAddressDarwin(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerGlobalAddressELF(SDValue Op, SelectionDAG &DAG) const;
     SDValue LowerGlobalAddressWindows(SDValue Op, SelectionDAG &DAG) const;
@@ -701,7 +733,7 @@ class InstrItineraryData;
 
     bool isUsedByReturnOnly(SDNode *N, SDValue &Chain) const override;
 
-    bool mayBeEmittedAsTailCall(CallInst *CI) const override;
+    bool mayBeEmittedAsTailCall(const CallInst *CI) const override;
 
     SDValue getCMOV(const SDLoc &dl, EVT VT, SDValue FalseVal, SDValue TrueVal,
                     SDValue ARMcc, SDValue CCR, SDValue Cmp,

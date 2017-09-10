@@ -46,11 +46,12 @@
 #include "llvm/ADT/DenseMap.h"
 #include "llvm/ADT/DenseMapInfo.h"
 #include "llvm/ADT/DenseSet.h"
-#include "llvm/ADT/iterator_range.h"
 #include "llvm/ADT/MapVector.h"
 #include "llvm/ADT/SmallVector.h"
+#include "llvm/ADT/iterator_range.h"
 #include "llvm/Analysis/AliasAnalysis.h"
 #include "llvm/Analysis/BasicAliasAnalysis.h"
+#include "llvm/Analysis/OptimizationDiagnosticInfo.h"
 #include "llvm/Analysis/TypeMetadataUtils.h"
 #include "llvm/IR/CallSite.h"
 #include "llvm/IR/Constants.h"
@@ -58,7 +59,6 @@
 #include "llvm/IR/DebugInfoMetadata.h"
 #include "llvm/IR/DebugLoc.h"
 #include "llvm/IR/DerivedTypes.h"
-#include "llvm/IR/DiagnosticInfo.h"
 #include "llvm/IR/Function.h"
 #include "llvm/IR/GlobalAlias.h"
 #include "llvm/IR/GlobalVariable.h"
@@ -275,18 +275,39 @@ struct VirtualCallSite {
   // of that field for details.
   unsigned *NumUnsafeUses;
 
-  void emitRemark(const Twine &OptName, const Twine &TargetName) {
+  void
+  emitRemark(const StringRef OptName, const StringRef TargetName,
+             function_ref<OptimizationRemarkEmitter &(Function *)> OREGetter) {
     Function *F = CS.getCaller();
-    emitOptimizationRemark(
-        F->getContext(), DEBUG_TYPE, *F,
-        CS.getInstruction()->getDebugLoc(),
-        OptName + ": devirtualized a call to " + TargetName);
+    DebugLoc DLoc = CS->getDebugLoc();
+    BasicBlock *Block = CS.getParent();
+
+    // In the new pass manager, we can request the optimization
+    // remark emitter pass on a per-function-basis, which the
+    // OREGetter will do for us.
+    // In the old pass manager, this is harder, so we just build
+    // a optimization remark emitter on the fly, when we need it.
+    std::unique_ptr<OptimizationRemarkEmitter> OwnedORE;
+    OptimizationRemarkEmitter *ORE;
+    if (OREGetter)
+      ORE = &OREGetter(F);
+    else {
+      OwnedORE = make_unique<OptimizationRemarkEmitter>(F);
+      ORE = OwnedORE.get();
+    }
+
+    using namespace ore;
+    ORE->emit(OptimizationRemark(DEBUG_TYPE, OptName, DLoc, Block)
+              << NV("Optimization", OptName) << ": devirtualized a call to "
+              << NV("FunctionName", TargetName));
   }
 
-  void replaceAndErase(const Twine &OptName, const Twine &TargetName,
-                       bool RemarksEnabled, Value *New) {
+  void replaceAndErase(
+      const StringRef OptName, const StringRef TargetName, bool RemarksEnabled,
+      function_ref<OptimizationRemarkEmitter &(Function *)> OREGetter,
+      Value *New) {
     if (RemarksEnabled)
-      emitRemark(OptName, TargetName);
+      emitRemark(OptName, TargetName, OREGetter);
     CS->replaceAllUsesWith(New);
     if (auto II = dyn_cast<InvokeInst>(CS.getInstruction())) {
       BranchInst::Create(II->getNormalDest(), CS.getInstruction());
@@ -373,8 +394,8 @@ struct DevirtModule {
   Module &M;
   function_ref<AAResults &(Function &)> AARGetter;
 
-  PassSummaryAction Action;
-  ModuleSummaryIndex *Summary;
+  ModuleSummaryIndex *ExportSummary;
+  const ModuleSummaryIndex *ImportSummary;
 
   IntegerType *Int8Ty;
   PointerType *Int8PtrTy;
@@ -383,6 +404,7 @@ struct DevirtModule {
   IntegerType *IntPtrTy;
 
   bool RemarksEnabled;
+  function_ref<OptimizationRemarkEmitter &(Function *)> OREGetter;
 
   MapVector<VTableSlot, VTableSlotInfo> CallSlots;
 
@@ -397,14 +419,18 @@ struct DevirtModule {
   std::map<CallInst *, unsigned> NumUnsafeUsesForTypeTest;
 
   DevirtModule(Module &M, function_ref<AAResults &(Function &)> AARGetter,
-               PassSummaryAction Action, ModuleSummaryIndex *Summary)
-      : M(M), AARGetter(AARGetter), Action(Action), Summary(Summary),
-        Int8Ty(Type::getInt8Ty(M.getContext())),
+               function_ref<OptimizationRemarkEmitter &(Function *)> OREGetter,
+               ModuleSummaryIndex *ExportSummary,
+               const ModuleSummaryIndex *ImportSummary)
+      : M(M), AARGetter(AARGetter), ExportSummary(ExportSummary),
+        ImportSummary(ImportSummary), Int8Ty(Type::getInt8Ty(M.getContext())),
         Int8PtrTy(Type::getInt8PtrTy(M.getContext())),
         Int32Ty(Type::getInt32Ty(M.getContext())),
         Int64Ty(Type::getInt64Ty(M.getContext())),
         IntPtrTy(M.getDataLayout().getIntPtrType(M.getContext(), 0)),
-        RemarksEnabled(areRemarksEnabled()) {}
+        RemarksEnabled(areRemarksEnabled()), OREGetter(OREGetter) {
+    assert(!(ExportSummary && ImportSummary));
+  }
 
   bool areRemarksEnabled();
 
@@ -479,8 +505,9 @@ struct DevirtModule {
 
   // Lower the module using the action and summary passed as command line
   // arguments. For testing purposes only.
-  static bool runForTesting(Module &M,
-                            function_ref<AAResults &(Function &)> AARGetter);
+  static bool runForTesting(
+      Module &M, function_ref<AAResults &(Function &)> AARGetter,
+      function_ref<OptimizationRemarkEmitter &(Function *)> OREGetter);
 };
 
 struct WholeProgramDevirt : public ModulePass {
@@ -488,24 +515,32 @@ struct WholeProgramDevirt : public ModulePass {
 
   bool UseCommandLine = false;
 
-  PassSummaryAction Action;
-  ModuleSummaryIndex *Summary;
+  ModuleSummaryIndex *ExportSummary;
+  const ModuleSummaryIndex *ImportSummary;
 
   WholeProgramDevirt() : ModulePass(ID), UseCommandLine(true) {
     initializeWholeProgramDevirtPass(*PassRegistry::getPassRegistry());
   }
 
-  WholeProgramDevirt(PassSummaryAction Action, ModuleSummaryIndex *Summary)
-      : ModulePass(ID), Action(Action), Summary(Summary) {
+  WholeProgramDevirt(ModuleSummaryIndex *ExportSummary,
+                     const ModuleSummaryIndex *ImportSummary)
+      : ModulePass(ID), ExportSummary(ExportSummary),
+        ImportSummary(ImportSummary) {
     initializeWholeProgramDevirtPass(*PassRegistry::getPassRegistry());
   }
 
   bool runOnModule(Module &M) override {
     if (skipModule(M))
       return false;
+
+    auto OREGetter = function_ref<OptimizationRemarkEmitter &(Function *)>();
+
     if (UseCommandLine)
-      return DevirtModule::runForTesting(M, LegacyAARGetter(*this));
-    return DevirtModule(M, LegacyAARGetter(*this), Action, Summary).run();
+      return DevirtModule::runForTesting(M, LegacyAARGetter(*this), OREGetter);
+
+    return DevirtModule(M, LegacyAARGetter(*this), OREGetter, ExportSummary,
+                        ImportSummary)
+        .run();
   }
 
   void getAnalysisUsage(AnalysisUsage &AU) const override {
@@ -524,9 +559,10 @@ INITIALIZE_PASS_END(WholeProgramDevirt, "wholeprogramdevirt",
                     "Whole program devirtualization", false, false)
 char WholeProgramDevirt::ID = 0;
 
-ModulePass *llvm::createWholeProgramDevirtPass(PassSummaryAction Action,
-                                               ModuleSummaryIndex *Summary) {
-  return new WholeProgramDevirt(Action, Summary);
+ModulePass *
+llvm::createWholeProgramDevirtPass(ModuleSummaryIndex *ExportSummary,
+                                   const ModuleSummaryIndex *ImportSummary) {
+  return new WholeProgramDevirt(ExportSummary, ImportSummary);
 }
 
 PreservedAnalyses WholeProgramDevirtPass::run(Module &M,
@@ -535,13 +571,17 @@ PreservedAnalyses WholeProgramDevirtPass::run(Module &M,
   auto AARGetter = [&](Function &F) -> AAResults & {
     return FAM.getResult<AAManager>(F);
   };
-  if (!DevirtModule(M, AARGetter, PassSummaryAction::None, nullptr).run())
+  auto OREGetter = [&](Function *F) -> OptimizationRemarkEmitter & {
+    return FAM.getResult<OptimizationRemarkEmitterAnalysis>(*F);
+  };
+  if (!DevirtModule(M, AARGetter, OREGetter, nullptr, nullptr).run())
     return PreservedAnalyses::all();
   return PreservedAnalyses::none();
 }
 
 bool DevirtModule::runForTesting(
-    Module &M, function_ref<AAResults &(Function &)> AARGetter) {
+    Module &M, function_ref<AAResults &(Function &)> AARGetter,
+    function_ref<OptimizationRemarkEmitter &(Function *)> OREGetter) {
   ModuleSummaryIndex Summary;
 
   // Handle the command-line summary arguments. This code is for testing
@@ -557,7 +597,12 @@ bool DevirtModule::runForTesting(
     ExitOnErr(errorCodeToError(In.error()));
   }
 
-  bool Changed = DevirtModule(M, AARGetter, ClSummaryAction, &Summary).run();
+  bool Changed =
+      DevirtModule(
+          M, AARGetter, OREGetter,
+          ClSummaryAction == PassSummaryAction::Export ? &Summary : nullptr,
+          ClSummaryAction == PassSummaryAction::Import ? &Summary : nullptr)
+          .run();
 
   if (!ClWriteSummary.empty()) {
     ExitOnError ExitOnErr(
@@ -672,7 +717,7 @@ void DevirtModule::applySingleImplDevirt(VTableSlotInfo &SlotInfo,
   auto Apply = [&](CallSiteInfo &CSInfo) {
     for (auto &&VCallSite : CSInfo.CallSites) {
       if (RemarksEnabled)
-        VCallSite.emitRemark("single-impl", TheFn->getName());
+        VCallSite.emitRemark("single-impl", TheFn->getName(), OREGetter);
       VCallSite.CS.setCalledFunction(ConstantExpr::getBitCast(
           TheFn, VCallSite.CS.getCalledValue()->getType()));
       // This use is no longer unsafe.
@@ -712,9 +757,24 @@ bool DevirtModule::trySingleImplDevirt(
   // to make it visible to thin LTO objects. We can only get here during the
   // ThinLTO export phase.
   if (TheFn->hasLocalLinkage()) {
+    std::string NewName = (TheFn->getName() + "$merged").str();
+
+    // Since we are renaming the function, any comdats with the same name must
+    // also be renamed. This is required when targeting COFF, as the comdat name
+    // must match one of the names of the symbols in the comdat.
+    if (Comdat *C = TheFn->getComdat()) {
+      if (C->getName() == TheFn->getName()) {
+        Comdat *NewC = M.getOrInsertComdat(NewName);
+        NewC->setSelectionKind(C->getSelectionKind());
+        for (GlobalObject &GO : M.global_objects())
+          if (GO.getComdat() == C)
+            GO.setComdat(NewC);
+      }
+    }
+
     TheFn->setLinkage(GlobalValue::ExternalLinkage);
     TheFn->setVisibility(GlobalValue::HiddenVisibility);
-    TheFn->setName(TheFn->getName() + "$merged");
+    TheFn->setName(NewName);
   }
 
   Res->TheKind = WholeProgramDevirtResolution::SingleImpl;
@@ -757,7 +817,7 @@ void DevirtModule::applyUniformRetValOpt(CallSiteInfo &CSInfo, StringRef FnName,
                                          uint64_t TheRetVal) {
   for (auto Call : CSInfo.CallSites)
     Call.replaceAndErase(
-        "uniform-ret-val", FnName, RemarksEnabled,
+        "uniform-ret-val", FnName, RemarksEnabled, OREGetter,
         ConstantInt::get(cast<IntegerType>(Call.CS.getType()), TheRetVal));
   CSInfo.markDevirt();
 }
@@ -831,10 +891,12 @@ void DevirtModule::applyUniqueRetValOpt(CallSiteInfo &CSInfo, StringRef FnName,
                                         Constant *UniqueMemberAddr) {
   for (auto &&Call : CSInfo.CallSites) {
     IRBuilder<> B(Call.CS.getInstruction());
-    Value *Cmp = B.CreateICmp(IsOne ? ICmpInst::ICMP_EQ : ICmpInst::ICMP_NE,
-                              Call.VTable, UniqueMemberAddr);
+    Value *Cmp =
+        B.CreateICmp(IsOne ? ICmpInst::ICMP_EQ : ICmpInst::ICMP_NE,
+                     B.CreateBitCast(Call.VTable, Int8PtrTy), UniqueMemberAddr);
     Cmp = B.CreateZExt(Cmp, Call.CS->getType());
-    Call.replaceAndErase("unique-ret-val", FnName, RemarksEnabled, Cmp);
+    Call.replaceAndErase("unique-ret-val", FnName, RemarksEnabled, OREGetter,
+                         Cmp);
   }
   CSInfo.markDevirt();
 }
@@ -897,17 +959,19 @@ void DevirtModule::applyVirtualConstProp(CallSiteInfo &CSInfo, StringRef FnName,
   for (auto Call : CSInfo.CallSites) {
     auto *RetType = cast<IntegerType>(Call.CS.getType());
     IRBuilder<> B(Call.CS.getInstruction());
-    Value *Addr = B.CreateGEP(Int8Ty, Call.VTable, Byte);
+    Value *Addr =
+        B.CreateGEP(Int8Ty, B.CreateBitCast(Call.VTable, Int8PtrTy), Byte);
     if (RetType->getBitWidth() == 1) {
       Value *Bits = B.CreateLoad(Addr);
       Value *BitsAndBit = B.CreateAnd(Bits, Bit);
       auto IsBitSet = B.CreateICmpNE(BitsAndBit, ConstantInt::get(Int8Ty, 0));
       Call.replaceAndErase("virtual-const-prop-1-bit", FnName, RemarksEnabled,
-                           IsBitSet);
+                           OREGetter, IsBitSet);
     } else {
       Value *ValAddr = B.CreateBitCast(Addr, RetType->getPointerTo());
       Value *Val = B.CreateLoad(RetType, ValAddr);
-      Call.replaceAndErase("virtual-const-prop", FnName, RemarksEnabled, Val);
+      Call.replaceAndErase("virtual-const-prop", FnName, RemarksEnabled,
+                           OREGetter, Val);
     }
   }
   CSInfo.markDevirt();
@@ -1100,8 +1164,7 @@ void DevirtModule::scanTypeTestUsers(Function *TypeTestFunc,
       Value *Ptr = CI->getArgOperand(0)->stripPointerCasts();
       if (SeenPtrs.insert(Ptr).second) {
         for (DevirtCallSite Call : DevirtCalls) {
-          CallSlots[{TypeId, Call.Offset}].addCallSite(CI->getArgOperand(0),
-                                                       Call.CS, nullptr);
+          CallSlots[{TypeId, Call.Offset}].addCallSite(Ptr, Call.CS, nullptr);
         }
       }
     }
@@ -1196,15 +1259,20 @@ void DevirtModule::scanTypeCheckedLoadUsers(Function *TypeCheckedLoadFunc) {
 }
 
 void DevirtModule::importResolution(VTableSlot Slot, VTableSlotInfo &SlotInfo) {
-  const WholeProgramDevirtResolution &Res =
-      Summary->getTypeIdSummary(cast<MDString>(Slot.TypeID)->getString())
-          .WPDRes[Slot.ByteOffset];
+  const TypeIdSummary *TidSummary =
+      ImportSummary->getTypeIdSummary(cast<MDString>(Slot.TypeID)->getString());
+  if (!TidSummary)
+    return;
+  auto ResI = TidSummary->WPDRes.find(Slot.ByteOffset);
+  if (ResI == TidSummary->WPDRes.end())
+    return;
+  const WholeProgramDevirtResolution &Res = ResI->second;
 
   if (Res.TheKind == WholeProgramDevirtResolution::SingleImpl) {
     // The type of the function in the declaration is irrelevant because every
     // call site will cast it to the correct type.
     auto *SingleImpl = M.getOrInsertFunction(
-        Res.SingleImplName, Type::getVoidTy(M.getContext()), nullptr);
+        Res.SingleImplName, Type::getVoidTy(M.getContext()));
 
     // This is the import phase so we should not be exporting anything.
     bool IsExported = false;
@@ -1265,7 +1333,7 @@ bool DevirtModule::run() {
   // Normally if there are no users of the devirtualization intrinsics in the
   // module, this pass has nothing to do. But if we are exporting, we also need
   // to handle any users that appear only in the function summaries.
-  if (Action != PassSummaryAction::Export &&
+  if (!ExportSummary &&
       (!TypeTestFunc || TypeTestFunc->use_empty() || !AssumeFunc ||
        AssumeFunc->use_empty()) &&
       (!TypeCheckedLoadFunc || TypeCheckedLoadFunc->use_empty()))
@@ -1277,7 +1345,7 @@ bool DevirtModule::run() {
   if (TypeCheckedLoadFunc)
     scanTypeCheckedLoadUsers(TypeCheckedLoadFunc);
 
-  if (Action == PassSummaryAction::Import) {
+  if (ImportSummary) {
     for (auto &S : CallSlots)
       importResolution(S.first, S.second);
 
@@ -1296,7 +1364,7 @@ bool DevirtModule::run() {
     return true;
 
   // Collect information from summary about which calls to try to devirtualize.
-  if (Action == PassSummaryAction::Export) {
+  if (ExportSummary) {
     DenseMap<GlobalValue::GUID, TinyPtrVector<Metadata *>> MetadataByGUID;
     for (auto &P : TypeIdMap) {
       if (auto *TypeId = dyn_cast<MDString>(P.first))
@@ -1304,8 +1372,8 @@ bool DevirtModule::run() {
             TypeId);
     }
 
-    for (auto &P : *Summary) {
-      for (auto &S : P.second) {
+    for (auto &P : *ExportSummary) {
+      for (auto &S : P.second.SummaryList) {
         auto *FS = dyn_cast<FunctionSummary>(S.get());
         if (!FS)
           continue;
@@ -1353,11 +1421,11 @@ bool DevirtModule::run() {
     if (tryFindVirtualCallTargets(TargetsForSlot, TypeIdMap[S.first.TypeID],
                                   S.first.ByteOffset)) {
       WholeProgramDevirtResolution *Res = nullptr;
-      if (Action == PassSummaryAction::Export && isa<MDString>(S.first.TypeID))
-        Res =
-            &Summary
-                 ->getTypeIdSummary(cast<MDString>(S.first.TypeID)->getString())
-                 .WPDRes[S.first.ByteOffset];
+      if (ExportSummary && isa<MDString>(S.first.TypeID))
+        Res = &ExportSummary
+                   ->getOrInsertTypeIdSummary(
+                       cast<MDString>(S.first.TypeID)->getString())
+                   .WPDRes[S.first.ByteOffset];
 
       if (!trySingleImplDevirt(TargetsForSlot, S.second, Res) &&
           tryVirtualConstProp(TargetsForSlot, S.second, Res, S.first))
@@ -1374,7 +1442,7 @@ bool DevirtModule::run() {
     // intrinsics were *not* devirtualized, we need to add the resulting
     // llvm.type.test intrinsics to the function summaries so that the
     // LowerTypeTests pass will export them.
-    if (Action == PassSummaryAction::Export && isa<MDString>(S.first.TypeID)) {
+    if (ExportSummary && isa<MDString>(S.first.TypeID)) {
       auto GUID =
           GlobalValue::getGUID(cast<MDString>(S.first.TypeID)->getString());
       for (auto FS : S.second.CSInfo.SummaryTypeCheckedLoadUsers)
@@ -1389,9 +1457,24 @@ bool DevirtModule::run() {
     // Generate remarks for each devirtualized function.
     for (const auto &DT : DevirtTargets) {
       Function *F = DT.second;
-      DISubprogram *SP = F->getSubprogram();
-      emitOptimizationRemark(F->getContext(), DEBUG_TYPE, *F, SP,
-                             Twine("devirtualized ") + F->getName());
+
+      // In the new pass manager, we can request the optimization
+      // remark emitter pass on a per-function-basis, which the
+      // OREGetter will do for us.
+      // In the old pass manager, this is harder, so we just build
+      // a optimization remark emitter on the fly, when we need it.
+      std::unique_ptr<OptimizationRemarkEmitter> OwnedORE;
+      OptimizationRemarkEmitter *ORE;
+      if (OREGetter)
+        ORE = &OREGetter(F);
+      else {
+        OwnedORE = make_unique<OptimizationRemarkEmitter>(F);
+        ORE = OwnedORE.get();
+      }
+
+      using namespace ore;
+      ORE->emit(OptimizationRemark(DEBUG_TYPE, "Devirtualized", F)
+                << "devirtualized " << NV("FunctionName", F->getName()));
     }
   }
 

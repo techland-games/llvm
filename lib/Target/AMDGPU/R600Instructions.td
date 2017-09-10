@@ -38,9 +38,7 @@ class InstFlag<string PM = "printOperand", int Default = 0>
 }
 
 // src_sel for ALU src operands, see also ALU_CONST, ALU_PARAM registers
-def SEL : OperandWithDefaultOps <i32, (ops (i32 -1))> {
-  let PrintMethod = "printSel";
-}
+def SEL : OperandWithDefaultOps <i32, (ops (i32 -1))>;
 def BANK_SWIZZLE : OperandWithDefaultOps <i32, (ops (i32 0))> {
   let PrintMethod = "printBankSwizzle";
 }
@@ -316,7 +314,7 @@ class VTX_READ <string name, dag outs, list<dag> pattern>
 class LoadParamFrag <PatFrag load_type> : PatFrag <
   (ops node:$ptr), (load_type node:$ptr),
   [{ return isConstantLoad(cast<LoadSDNode>(N), 0) ||
-            (cast<LoadSDNode>(N)->getAddressSpace() == AMDGPUAS::PARAM_I_ADDRESS); }]
+            (cast<LoadSDNode>(N)->getAddressSpace() == AMDGPUASI.PARAM_I_ADDRESS); }]
 >;
 
 def vtx_id3_az_extloadi8 : LoadParamFrag<az_extloadi8>;
@@ -326,8 +324,8 @@ def vtx_id3_load : LoadParamFrag<load>;
 class LoadVtxId1 <PatFrag load> : PatFrag <
   (ops node:$ptr), (load node:$ptr), [{
   const MemSDNode *LD = cast<MemSDNode>(N);
-  return LD->getAddressSpace() == AMDGPUAS::GLOBAL_ADDRESS ||
-         (LD->getAddressSpace() == AMDGPUAS::CONSTANT_ADDRESS &&
+  return LD->getAddressSpace() == AMDGPUASI.GLOBAL_ADDRESS ||
+         (LD->getAddressSpace() == AMDGPUASI.CONSTANT_ADDRESS &&
            !isa<GlobalValue>(GetUnderlyingObject(
            LD->getMemOperand()->getValue(), CurDAG->getDataLayout())));
 }]>;
@@ -339,7 +337,7 @@ def vtx_id1_load : LoadVtxId1 <load>;
 class LoadVtxId2 <PatFrag load> : PatFrag <
   (ops node:$ptr), (load node:$ptr), [{
   const MemSDNode *LD = cast<MemSDNode>(N);
-  return LD->getAddressSpace() == AMDGPUAS::CONSTANT_ADDRESS &&
+  return LD->getAddressSpace() == AMDGPUASI.CONSTANT_ADDRESS &&
          isa<GlobalValue>(GetUnderlyingObject(
          LD->getMemOperand()->getValue(), CurDAG->getDataLayout()));
 }]>;

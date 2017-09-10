@@ -15,8 +15,9 @@
 #ifndef LLVM_CODEGEN_MACHINEMODULEINFOIMPLS_H
 #define LLVM_CODEGEN_MACHINEMODULEINFOIMPLS_H
 
-#include "llvm/CodeGen/ValueTypes.h"
+#include "llvm/BinaryFormat/Wasm.h"
 #include "llvm/CodeGen/MachineModuleInfo.h"
+#include "llvm/CodeGen/ValueTypes.h"
 
 namespace llvm {
 class MCSymbol;
@@ -74,32 +75,6 @@ public:
   /// Accessor methods to return the set of stubs in sorted order.
 
   SymbolListTy GetGVStubList() { return getSortedStubs(GVStubs); }
-};
-
-/// MachineModuleInfoWasm - This is a MachineModuleInfoImpl implementation
-/// for Wasm targets.
-class MachineModuleInfoWasm : public MachineModuleInfoImpl {
-  /// GVStubs - These stubs are used to materialize global addresses in PIC
-  /// mode.
-  std::vector<MVT> Globals;
-  unsigned StackPointerGlobal;
-
-  virtual void anchor(); // Out of line virtual method.
-public:
-  MachineModuleInfoWasm(const MachineModuleInfo &)
-    : StackPointerGlobal(-1U) {}
-
-  void addGlobal(MVT VT) { Globals.push_back(VT); }
-  const std::vector<MVT> &getGlobals() const { return Globals; }
-
-  bool hasStackPointerGlobal() const {
-    return StackPointerGlobal != -1U;
-  }
-  unsigned getStackPointerGlobal() const {
-    assert(hasStackPointerGlobal() && "Stack ptr global hasn't been set");
-    return StackPointerGlobal;
-  }
-  void setStackPointerGlobal(unsigned Global) { StackPointerGlobal = Global; }
 };
 
 } // end namespace llvm

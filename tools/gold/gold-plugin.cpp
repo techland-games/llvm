@@ -21,7 +21,9 @@
 #include "llvm/IR/DiagnosticPrinter.h"
 #include "llvm/LTO/Caching.h"
 #include "llvm/LTO/LTO.h"
+#include "llvm/Object/Error.h"
 #include "llvm/Support/CommandLine.h"
+#include "llvm/Support/FileSystem.h"
 #include "llvm/Support/ManagedStatic.h"
 #include "llvm/Support/MemoryBuffer.h"
 #include "llvm/Support/Path.h"
@@ -100,7 +102,7 @@ static ld_plugin_add_input_file add_input_file = nullptr;
 static ld_plugin_set_extra_library_path set_extra_library_path = nullptr;
 static ld_plugin_get_view get_view = nullptr;
 static bool IsExecutable = false;
-static Optional<Reloc::Model> RelocationModel;
+static Optional<Reloc::Model> RelocationModel = None;
 static std::string output_name = "";
 static std::list<claimed_file> Modules;
 static DenseMap<int, void *> FDToLeaderHandle;
@@ -164,6 +166,12 @@ namespace options {
   // corresponding bitcode file, will use a path formed by replacing the
   // bitcode file's path prefix matching oldprefix with newprefix.
   static std::string thinlto_prefix_replace;
+  // Option to control the name of modules encoded in the individual index
+  // files for a distributed backend. This enables the use of minimized
+  // bitcode files for the thin link, assuming the name of the full bitcode
+  // file used in the backend differs just in some part of the file suffix.
+  // If specified, expects a string of the form "oldsuffix:newsuffix".
+  static std::string thinlto_object_suffix_replace;
   // Optional path to a directory for caching ThinLTO objects.
   static std::string cache_dir;
   // Additional options to pass into the code generator.
@@ -206,6 +214,12 @@ namespace options {
       thinlto_prefix_replace = opt.substr(strlen("thinlto-prefix-replace="));
       if (thinlto_prefix_replace.find(';') == std::string::npos)
         message(LDPL_FATAL, "thinlto-prefix-replace expects 'old;new' format");
+    } else if (opt.startswith("thinlto-object-suffix-replace=")) {
+      thinlto_object_suffix_replace =
+          opt.substr(strlen("thinlto-object-suffix-replace="));
+      if (thinlto_object_suffix_replace.find(';') == std::string::npos)
+        message(LDPL_FATAL,
+                "thinlto-object-suffix-replace expects 'old;new' format");
     } else if (opt.startswith("cache-dir=")) {
       cache_dir = opt.substr(strlen("cache-dir="));
     } else if (opt.size() == 2 && opt[0] == 'O') {
@@ -268,6 +282,8 @@ ld_plugin_status onload(ld_plugin_tv *tv) {
     case LDPT_LINKER_OUTPUT:
       switch (tv->tv_u.tv_val) {
       case LDPO_REL: // .o
+        IsExecutable = false;
+        break;
       case LDPO_DYN: // .so
         IsExecutable = false;
         RelocationModel = Reloc::PIC_;
@@ -451,7 +467,7 @@ static ld_plugin_status claim_file_hook(const ld_plugin_input_file *file,
           EC == object::object_error::bitcode_section_not_found)
         *claimed = 0;
       else
-        message(LDPL_ERROR,
+        message(LDPL_FATAL,
                 "LLVM gold plugin has failed to create LTO module: %s",
                 EI.message().c_str());
     });
@@ -461,7 +477,7 @@ static ld_plugin_status claim_file_hook(const ld_plugin_input_file *file,
 
   std::unique_ptr<InputFile> Obj = std::move(*ObjOrErr);
 
-  Modules.resize(Modules.size() + 1);
+  Modules.emplace_back();
   claimed_file &cf = Modules.back();
 
   cf.handle = file->handle;
@@ -484,8 +500,6 @@ static ld_plugin_status claim_file_hook(const ld_plugin_input_file *file,
                sys::path::filename(Obj->getSourceFileName()).str();
 
   for (auto &Sym : Obj->symbols()) {
-    uint32_t Symflags = Sym.getFlags();
-
     cf.syms.push_back(ld_plugin_symbol());
     ld_plugin_symbol &sym = cf.syms.back();
     sym.version = nullptr;
@@ -511,20 +525,20 @@ static ld_plugin_status claim_file_hook(const ld_plugin_input_file *file,
       break;
     }
 
-    if (Symflags & object::BasicSymbolRef::SF_Undefined) {
+    if (Sym.isUndefined()) {
       sym.def = LDPK_UNDEF;
-      if (Symflags & object::BasicSymbolRef::SF_Weak)
+      if (Sym.isWeak())
         sym.def = LDPK_WEAKUNDEF;
-    } else if (Symflags & object::BasicSymbolRef::SF_Common)
+    } else if (Sym.isCommon())
       sym.def = LDPK_COMMON;
-    else if (Symflags & object::BasicSymbolRef::SF_Weak)
+    else if (Sym.isWeak())
       sym.def = LDPK_WEAKDEF;
     else
       sym.def = LDPK_DEF;
 
     sym.size = 0;
     sym.comdat_key = nullptr;
-    int CI = check(Sym.getComdatIndex());
+    int CI = Sym.getComdatIndex();
     if (CI != -1) {
       StringRef C = Obj->getComdatTable()[CI];
       sym.comdat_key = strdup(C.str().c_str());
@@ -566,8 +580,45 @@ static const void *getSymbolsAndView(claimed_file &F) {
   return View;
 }
 
-static void addModule(LTO &Lto, claimed_file &F, const void *View) {
-  MemoryBufferRef BufferRef(StringRef((const char *)View, F.filesize), F.name);
+/// Parse the thinlto-object-suffix-replace option into the \p OldSuffix and
+/// \p NewSuffix strings, if it was specified.
+static void getThinLTOOldAndNewSuffix(std::string &OldSuffix,
+                                      std::string &NewSuffix) {
+  assert(options::thinlto_object_suffix_replace.empty() ||
+         options::thinlto_object_suffix_replace.find(";") != StringRef::npos);
+  StringRef SuffixReplace = options::thinlto_object_suffix_replace;
+  std::tie(OldSuffix, NewSuffix) = SuffixReplace.split(';');
+}
+
+/// Given the original \p Path to an output file, replace any filename
+/// suffix matching \p OldSuffix with \p NewSuffix.
+static std::string getThinLTOObjectFileName(StringRef Path, StringRef OldSuffix,
+                                            StringRef NewSuffix) {
+  if (OldSuffix.empty() && NewSuffix.empty())
+    return Path;
+  StringRef NewPath = Path;
+  NewPath.consume_back(OldSuffix);
+  std::string NewNewPath = NewPath;
+  NewNewPath += NewSuffix;
+  return NewNewPath;
+}
+
+static bool isAlpha(char C) {
+  return ('a' <= C && C <= 'z') || ('A' <= C && C <= 'Z') || C == '_';
+}
+
+static bool isAlnum(char C) { return isAlpha(C) || ('0' <= C && C <= '9'); }
+
+// Returns true if S is valid as a C language identifier.
+static bool isValidCIdentifier(StringRef S) {
+  return !S.empty() && isAlpha(S[0]) &&
+         std::all_of(S.begin() + 1, S.end(), isAlnum);
+}
+
+static void addModule(LTO &Lto, claimed_file &F, const void *View,
+                      StringRef Filename) {
+  MemoryBufferRef BufferRef(StringRef((const char *)View, F.filesize),
+                            Filename);
   Expected<std::unique_ptr<InputFile>> ObjOrErr = InputFile::create(BufferRef);
 
   if (!ObjOrErr)
@@ -575,8 +626,12 @@ static void addModule(LTO &Lto, claimed_file &F, const void *View) {
             toString(ObjOrErr.takeError()).c_str());
 
   unsigned SymNum = 0;
+  std::unique_ptr<InputFile> Input = std::move(ObjOrErr.get());
+  auto InputFileSyms = Input->symbols();
+  assert(InputFileSyms.size() == F.syms.size());
   std::vector<SymbolResolution> Resols(F.syms.size());
   for (ld_plugin_symbol &Sym : F.syms) {
+    const InputFile::Symbol &InpSym = InputFileSyms[SymNum];
     SymbolResolution &R = Resols[SymNum++];
 
     ld_plugin_symbol_resolution Resolution =
@@ -612,6 +667,13 @@ static void addModule(LTO &Lto, claimed_file &F, const void *View) {
       break;
     }
 
+    // If the symbol has a C identifier section name, we need to mark
+    // it as visible to a regular object so that LTO will keep it around
+    // to ensure the linker generates special __start_<secname> and
+    // __stop_<secname> symbols which may be used elsewhere.
+    if (isValidCIdentifier(InpSym.getSectionName()))
+      R.VisibleToRegularObj = true;
+
     if (Resolution != LDPR_RESOLVED_DYN && Resolution != LDPR_UNDEF &&
         (IsExecutable || !Res.DefaultVisibility))
       R.FinalDefinitionInLinkageUnit = true;
@@ -619,27 +681,28 @@ static void addModule(LTO &Lto, claimed_file &F, const void *View) {
     freeSymName(Sym);
   }
 
-  check(Lto.add(std::move(*ObjOrErr), Resols),
+  check(Lto.add(std::move(Input), Resols),
         std::string("Failed to link module ") + F.name);
 }
 
-static void recordFile(std::string Filename, bool TempOutFile) {
+static void recordFile(const std::string &Filename, bool TempOutFile) {
   if (add_input_file(Filename.c_str()) != LDPS_OK)
     message(LDPL_FATAL,
             "Unable to add .o file to the link. File left behind in: %s",
             Filename.c_str());
   if (TempOutFile)
-    Cleanup.push_back(Filename.c_str());
+    Cleanup.push_back(Filename);
 }
 
 /// Return the desired output filename given a base input name, a flag
 /// indicating whether a temp file should be generated, and an optional task id.
 /// The new filename generated is returned in \p NewFilename.
-static void getOutputFileName(SmallString<128> InFilename, bool TempOutFile,
-                              SmallString<128> &NewFilename, int TaskID) {
+static int getOutputFileName(StringRef InFilename, bool TempOutFile,
+                             SmallString<128> &NewFilename, int TaskID) {
+  int FD = -1;
   if (TempOutFile) {
     std::error_code EC =
-        sys::fs::createTemporaryFile("lto-llvm", "o", NewFilename);
+        sys::fs::createTemporaryFile("lto-llvm", "o", FD, NewFilename);
     if (EC)
       message(LDPL_FATAL, "Could not create temporary file: %s",
               EC.message().c_str());
@@ -647,7 +710,13 @@ static void getOutputFileName(SmallString<128> InFilename, bool TempOutFile,
     NewFilename = InFilename;
     if (TaskID > 0)
       NewFilename += utostr(TaskID);
+    std::error_code EC =
+        sys::fs::openFileForWrite(NewFilename, FD, sys::fs::F_None);
+    if (EC)
+      message(LDPL_FATAL, "Could not open file %s: %s", NewFilename.c_str(),
+              EC.message().c_str());
   }
+  return FD;
 }
 
 static CodeGenOpt::Level getCGOptLevel() {
@@ -670,9 +739,7 @@ static void getThinLTOOldAndNewPrefix(std::string &OldPrefix,
                                       std::string &NewPrefix) {
   StringRef PrefixReplace = options::thinlto_prefix_replace;
   assert(PrefixReplace.empty() || PrefixReplace.find(";") != StringRef::npos);
-  std::pair<StringRef, StringRef> Split = PrefixReplace.split(";");
-  OldPrefix = Split.first.str();
-  NewPrefix = Split.second.str();
+  std::tie(OldPrefix, NewPrefix) = PrefixReplace.split(';');
 }
 
 static std::unique_ptr<LTO> createLTO() {
@@ -686,8 +753,12 @@ static std::unique_ptr<LTO> createLTO() {
   // FIXME: Check the gold version or add a new option to enable them.
   Conf.Options.RelaxELFRelocations = false;
 
+  // Enable function/data sections by default.
+  Conf.Options.FunctionSections = true;
+  Conf.Options.DataSections = true;
+
   Conf.MAttrs = MAttrs;
-  Conf.RelocModel = *RelocationModel;
+  Conf.RelocModel = RelocationModel;
   Conf.CGOptLevel = getCGOptLevel();
   Conf.DisableVerify = options::DisableVerify;
   Conf.OptLevel = options::OptLevel;
@@ -789,19 +860,31 @@ static ld_plugin_status allSymbolsReadHook() {
   if (options::thinlto_index_only)
     getThinLTOOldAndNewPrefix(OldPrefix, NewPrefix);
 
+  std::string OldSuffix, NewSuffix;
+  getThinLTOOldAndNewSuffix(OldSuffix, NewSuffix);
+  // Set for owning string objects used as buffer identifiers.
+  StringSet<> ObjectFilenames;
+
   for (claimed_file &F : Modules) {
     if (options::thinlto && !HandleToInputFile.count(F.leader_handle))
       HandleToInputFile.insert(std::make_pair(
           F.leader_handle, llvm::make_unique<PluginInputFile>(F.handle)));
     const void *View = getSymbolsAndView(F);
+    // In case we are thin linking with a minimized bitcode file, ensure
+    // the module paths encoded in the index reflect where the backends
+    // will locate the full bitcode files for compiling/importing.
+    std::string Identifier =
+        getThinLTOObjectFileName(F.name, OldSuffix, NewSuffix);
+    auto ObjFilename = ObjectFilenames.insert(Identifier);
+    assert(ObjFilename.second);
     if (!View) {
       if (options::thinlto_index_only)
         // Write empty output files that may be expected by the distributed
         // build system.
-        writeEmptyDistributedBuildOutputs(F.name, OldPrefix, NewPrefix);
+        writeEmptyDistributedBuildOutputs(Identifier, OldPrefix, NewPrefix);
       continue;
     }
-    addModule(*Lto, F, View);
+    addModule(*Lto, F, View, ObjFilename.first->first());
   }
 
   SmallString<128> Filename;
@@ -819,22 +902,17 @@ static ld_plugin_status allSymbolsReadHook() {
   auto AddStream =
       [&](size_t Task) -> std::unique_ptr<lto::NativeObjectStream> {
     IsTemporary[Task] = !SaveTemps;
-    getOutputFileName(Filename, /*TempOutFile=*/!SaveTemps, Filenames[Task],
-                      Task);
-    int FD;
-    std::error_code EC =
-        sys::fs::openFileForWrite(Filenames[Task], FD, sys::fs::F_None);
-    if (EC)
-      message(LDPL_FATAL, "Could not open file %s: %s", Filenames[Task].c_str(),
-              EC.message().c_str());
+    int FD = getOutputFileName(Filename, /*TempOutFile=*/!SaveTemps,
+                               Filenames[Task], Task);
     return llvm::make_unique<lto::NativeObjectStream>(
         llvm::make_unique<llvm::raw_fd_ostream>(FD, true));
   };
 
-  auto AddBuffer = [&](size_t Task, std::unique_ptr<MemoryBuffer> MB) {
+  auto AddBuffer = [&](size_t Task, std::unique_ptr<MemoryBuffer> MB,
+                       StringRef Path) {
     // Note that this requires that the memory buffers provided to AddBuffer are
     // backed by a file.
-    Filenames[Task] = MB->getBufferIdentifier();
+    Filenames[Task] = Path;
   };
 
   NativeObjectCache Cache;

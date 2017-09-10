@@ -17,8 +17,10 @@
 #include "llvm/ADT/STLExtras.h"
 #include "llvm/Analysis/AssumptionCache.h"
 #include "llvm/Analysis/ConstantFolding.h"
+#include "llvm/Analysis/InstructionSimplify.h"
 #include "llvm/Analysis/TargetLibraryInfo.h"
 #include "llvm/Analysis/ValueTracking.h"
+#include "llvm/IR/AssemblyAnnotationWriter.h"
 #include "llvm/IR/CFG.h"
 #include "llvm/IR/ConstantRange.h"
 #include "llvm/IR/Constants.h"
@@ -31,6 +33,7 @@
 #include "llvm/IR/PatternMatch.h"
 #include "llvm/IR/ValueHandle.h"
 #include "llvm/Support/Debug.h"
+#include "llvm/Support/FormattedStream.h"
 #include "llvm/Support/raw_ostream.h"
 #include <map>
 #include <stack>
@@ -140,10 +143,19 @@ public:
     return Val;
   }
 
-  ConstantRange getConstantRange() const {
+  const ConstantRange &getConstantRange() const {
     assert(isConstantRange() &&
            "Cannot get the constant-range of a non-constant-range!");
     return Range;
+  }
+
+  Optional<APInt> asConstantInteger() const {
+    if (isConstant() && isa<ConstantInt>(Val)) {
+      return cast<ConstantInt>(Val)->getValue();
+    } else if (isConstantRange() && Range.isSingleElement()) {
+      return *Range.getSingleElement();
+    }
+    return None;
   }
 
 private:
@@ -248,7 +260,7 @@ public:
     if (NewR.isFullSet())
       markOverdefined();
     else
-      markConstantRange(NewR);
+      markConstantRange(std::move(NewR));
   }
 };
 
@@ -300,7 +312,7 @@ static bool hasSingleValue(const LVILatticeVal &Val) {
 ///   contradictory.  If this happens, we return some valid lattice value so as
 ///   not confuse the rest of LVI.  Ideally, we'd always return Undefined, but
 ///   we do not make this guarantee.  TODO: This would be a useful enhancement.
-static LVILatticeVal intersect(LVILatticeVal A, LVILatticeVal B) {
+static LVILatticeVal intersect(const LVILatticeVal &A, const LVILatticeVal &B) {
   // Undefined is the strongest state.  It means the value is known to be along
   // an unreachable path.
   if (A.isUndefined())
@@ -373,19 +385,19 @@ namespace {
       SmallDenseMap<PoisoningVH<BasicBlock>, LVILatticeVal, 4> BlockVals;
     };
 
-    /// This is all of the cached information for all values,
-    /// mapped from Value* to key information.
-    DenseMap<Value *, std::unique_ptr<ValueCacheEntryTy>> ValueCache;
-
     /// This tracks, on a per-block basis, the set of values that are
     /// over-defined at the end of that block.
     typedef DenseMap<PoisoningVH<BasicBlock>, SmallPtrSet<Value *, 4>>
         OverDefinedCacheTy;
-    OverDefinedCacheTy OverDefinedCache;
-
     /// Keep track of all blocks that we have ever seen, so we
     /// don't spend time removing unused blocks from our caches.
     DenseSet<PoisoningVH<BasicBlock> > SeenBlocks;
+
+    /// This is all of the cached information for all values,
+    /// mapped from Value* to key information.
+    DenseMap<Value *, std::unique_ptr<ValueCacheEntryTy>> ValueCache;
+    OverDefinedCacheTy OverDefinedCache;
+
 
   public:
     void insertResult(Value *Val, BasicBlock *BB, const LVILatticeVal &Result) {
@@ -555,6 +567,30 @@ void LazyValueInfoCache::threadEdgeImpl(BasicBlock *OldSucc,
   }
 }
 
+
+namespace {
+/// An assembly annotator class to print LazyValueCache information in
+/// comments.
+class LazyValueInfoImpl;
+class LazyValueInfoAnnotatedWriter : public AssemblyAnnotationWriter {
+  LazyValueInfoImpl *LVIImpl;
+  // While analyzing which blocks we can solve values for, we need the dominator
+  // information. Since this is an optional parameter in LVI, we require this
+  // DomTreeAnalysis pass in the printer pass, and pass the dominator
+  // tree to the LazyValueInfoAnnotatedWriter.
+  DominatorTree &DT;
+
+public:
+  LazyValueInfoAnnotatedWriter(LazyValueInfoImpl *L, DominatorTree &DTree)
+      : LVIImpl(L), DT(DTree) {}
+
+  virtual void emitBasicBlockStartAnnot(const BasicBlock *BB,
+                                        formatted_raw_ostream &OS);
+
+  virtual void emitInstructionAnnot(const Instruction *I,
+                                    formatted_raw_ostream &OS);
+};
+}
 namespace {
   // The actual implementation of the lazy analysis and update.  Note that the
   // inheritance from LazyValueInfoCache is intended to be temporary while
@@ -602,13 +638,13 @@ namespace {
   bool solveBlockValuePHINode(LVILatticeVal &BBLV, PHINode *PN, BasicBlock *BB);
   bool solveBlockValueSelect(LVILatticeVal &BBLV, SelectInst *S,
                              BasicBlock *BB);
-  bool solveBlockValueBinaryOp(LVILatticeVal &BBLV, Instruction *BBI,
+  bool solveBlockValueBinaryOp(LVILatticeVal &BBLV, BinaryOperator *BBI,
                                BasicBlock *BB);
-  bool solveBlockValueCast(LVILatticeVal &BBLV, Instruction *BBI,
+  bool solveBlockValueCast(LVILatticeVal &BBLV, CastInst *CI,
                            BasicBlock *BB);
   void intersectAssumeOrGuardBlockValueConstantRange(Value *Val,
                                                      LVILatticeVal &BBLV,
-                                              Instruction *BBI);
+                                                     Instruction *BBI);
 
   void solve();
 
@@ -633,6 +669,12 @@ namespace {
       TheCache.clear();
     }
 
+    /// Printing the LazyValueInfo Analysis.
+    void printLVI(Function &F, DominatorTree &DTree, raw_ostream &OS) {
+        LazyValueInfoAnnotatedWriter Writer(this, DTree);
+        F.print(OS, &Writer);
+    }
+
     /// This is part of the update interface to inform the cache
     /// that a block has been deleted.
     void eraseBlock(BasicBlock *BB) {
@@ -648,6 +690,7 @@ namespace {
         : AC(AC), DL(DL), DT(DT) {}
   };
 } // end anonymous namespace
+
 
 void LazyValueInfoImpl::solve() {
   SmallVector<std::pair<BasicBlock *, Value *>, 8> StartingStack(
@@ -773,23 +816,23 @@ bool LazyValueInfoImpl::solveBlockValueImpl(LVILatticeVal &Res,
   // that for all other pointer typed values, we terminate the search at the
   // definition.  We could easily extend this to look through geps, bitcasts,
   // and the like to prove non-nullness, but it's not clear that's worth it
-  // compile time wise.  The context-insensative value walk done inside
-  // isKnownNonNull gets most of the profitable cases at much less expense.
+  // compile time wise.  The context-insensitive value walk done inside
+  // isKnownNonZero gets most of the profitable cases at much less expense.
   // This does mean that we have a sensativity to where the defining
   // instruction is placed, even if it could legally be hoisted much higher.
   // That is unfortunate.
   PointerType *PT = dyn_cast<PointerType>(BBI->getType());
-  if (PT && isKnownNonNull(BBI)) {
+  if (PT && isKnownNonZero(BBI, DL)) {
     Res = LVILatticeVal::getNot(ConstantPointerNull::get(PT));
     return true;
   }
   if (BBI->getType()->isIntegerTy()) {
-    if (isa<CastInst>(BBI))
-      return solveBlockValueCast(Res, BBI, BB);
-    
+    if (auto *CI = dyn_cast<CastInst>(BBI))
+      return solveBlockValueCast(Res, CI, BB);
+
     BinaryOperator *BO = dyn_cast<BinaryOperator>(BBI);
     if (BO && isa<ConstantInt>(BO->getOperand(1)))
-      return solveBlockValueBinaryOp(Res, BBI, BB);
+      return solveBlockValueBinaryOp(Res, BO, BB);
   }
 
   DEBUG(dbgs() << " compute BB '" << BB->getName()
@@ -855,10 +898,10 @@ bool LazyValueInfoImpl::solveBlockValueNonLocal(LVILatticeVal &BBLV,
   // value is overdefined.
   if (BB == &BB->getParent()->getEntryBlock()) {
     assert(isa<Argument>(Val) && "Unknown live-in to the entry block");
-    // Bofore giving up, see if we can prove the pointer non-null local to
+    // Before giving up, see if we can prove the pointer non-null local to
     // this particular block.
     if (Val->getType()->isPointerTy() &&
-        (isKnownNonNull(Val) || isObjectDereferencedInBlock(Val, BB))) {
+        (isKnownNonZero(Val, DL) || isObjectDereferencedInBlock(Val, BB))) {
       PointerType *PTy = cast<PointerType>(Val->getType());
       Result = LVILatticeVal::getNot(ConstantPointerNull::get(PTy));
     } else {
@@ -1014,8 +1057,8 @@ bool LazyValueInfoImpl::solveBlockValueSelect(LVILatticeVal &BBLV,
   }
 
   if (TrueVal.isConstantRange() && FalseVal.isConstantRange()) {
-    ConstantRange TrueCR = TrueVal.getConstantRange();
-    ConstantRange FalseCR = FalseVal.getConstantRange();
+    const ConstantRange &TrueCR = TrueVal.getConstantRange();
+    const ConstantRange &FalseCR = FalseVal.getConstantRange();
     Value *LHS = nullptr;
     Value *RHS = nullptr;
     SelectPatternResult SPR = matchSelectPattern(SI, LHS, RHS);
@@ -1103,9 +1146,9 @@ bool LazyValueInfoImpl::solveBlockValueSelect(LVILatticeVal &BBLV,
 }
 
 bool LazyValueInfoImpl::solveBlockValueCast(LVILatticeVal &BBLV,
-                                             Instruction *BBI,
-                                             BasicBlock *BB) {
-  if (!BBI->getOperand(0)->getType()->isSized()) {
+                                            CastInst *CI,
+                                            BasicBlock *BB) {
+  if (!CI->getOperand(0)->getType()->isSized()) {
     // Without knowing how wide the input is, we can't analyze it in any useful
     // way.
     BBLV = LVILatticeVal::getOverdefined();
@@ -1115,7 +1158,7 @@ bool LazyValueInfoImpl::solveBlockValueCast(LVILatticeVal &BBLV,
   // Filter out casts we don't know how to reason about before attempting to
   // recurse on our operand.  This can cut a long search short if we know we're
   // not going to be able to get any useful information anways.
-  switch (BBI->getOpcode()) {
+  switch (CI->getOpcode()) {
   case Instruction::Trunc:
   case Instruction::SExt:
   case Instruction::ZExt:
@@ -1132,44 +1175,43 @@ bool LazyValueInfoImpl::solveBlockValueCast(LVILatticeVal &BBLV,
   // Figure out the range of the LHS.  If that fails, we still apply the
   // transfer rule on the full set since we may be able to locally infer
   // interesting facts.
-  if (!hasBlockValue(BBI->getOperand(0), BB))
-    if (pushBlockValue(std::make_pair(BB, BBI->getOperand(0))))
+  if (!hasBlockValue(CI->getOperand(0), BB))
+    if (pushBlockValue(std::make_pair(BB, CI->getOperand(0))))
       // More work to do before applying this transfer rule.
       return false;
 
   const unsigned OperandBitWidth =
-    DL.getTypeSizeInBits(BBI->getOperand(0)->getType());
+    DL.getTypeSizeInBits(CI->getOperand(0)->getType());
   ConstantRange LHSRange = ConstantRange(OperandBitWidth);
-  if (hasBlockValue(BBI->getOperand(0), BB)) {
-    LVILatticeVal LHSVal = getBlockValue(BBI->getOperand(0), BB);
-    intersectAssumeOrGuardBlockValueConstantRange(BBI->getOperand(0), LHSVal,
-                                                  BBI);
+  if (hasBlockValue(CI->getOperand(0), BB)) {
+    LVILatticeVal LHSVal = getBlockValue(CI->getOperand(0), BB);
+    intersectAssumeOrGuardBlockValueConstantRange(CI->getOperand(0), LHSVal,
+                                                  CI);
     if (LHSVal.isConstantRange())
       LHSRange = LHSVal.getConstantRange();
   }
 
-  const unsigned ResultBitWidth =
-    cast<IntegerType>(BBI->getType())->getBitWidth();
+  const unsigned ResultBitWidth = CI->getType()->getIntegerBitWidth();
 
   // NOTE: We're currently limited by the set of operations that ConstantRange
   // can evaluate symbolically.  Enhancing that set will allows us to analyze
   // more definitions.
-  auto CastOp = (Instruction::CastOps) BBI->getOpcode();
-  BBLV = LVILatticeVal::getRange(LHSRange.castOp(CastOp, ResultBitWidth));
+  BBLV = LVILatticeVal::getRange(LHSRange.castOp(CI->getOpcode(),
+                                                 ResultBitWidth));
   return true;
 }
 
 bool LazyValueInfoImpl::solveBlockValueBinaryOp(LVILatticeVal &BBLV,
-                                                 Instruction *BBI,
+                                                 BinaryOperator *BO,
                                                  BasicBlock *BB) {
 
-  assert(BBI->getOperand(0)->getType()->isSized() &&
+  assert(BO->getOperand(0)->getType()->isSized() &&
          "all operands to binary operators are sized");
 
   // Filter out operators we don't know how to reason about before attempting to
   // recurse on our operand(s).  This can cut a long search short if we know
-  // we're not going to be able to get any useful information anways.
-  switch (BBI->getOpcode()) {
+  // we're not going to be able to get any useful information anyways.
+  switch (BO->getOpcode()) {
   case Instruction::Add:
   case Instruction::Sub:
   case Instruction::Mul:
@@ -1191,29 +1233,29 @@ bool LazyValueInfoImpl::solveBlockValueBinaryOp(LVILatticeVal &BBLV,
   // Figure out the range of the LHS.  If that fails, use a conservative range,
   // but apply the transfer rule anyways.  This lets us pick up facts from
   // expressions like "and i32 (call i32 @foo()), 32"
-  if (!hasBlockValue(BBI->getOperand(0), BB))
-    if (pushBlockValue(std::make_pair(BB, BBI->getOperand(0))))
+  if (!hasBlockValue(BO->getOperand(0), BB))
+    if (pushBlockValue(std::make_pair(BB, BO->getOperand(0))))
       // More work to do before applying this transfer rule.
       return false;
 
   const unsigned OperandBitWidth =
-    DL.getTypeSizeInBits(BBI->getOperand(0)->getType());
+    DL.getTypeSizeInBits(BO->getOperand(0)->getType());
   ConstantRange LHSRange = ConstantRange(OperandBitWidth);
-  if (hasBlockValue(BBI->getOperand(0), BB)) {
-    LVILatticeVal LHSVal = getBlockValue(BBI->getOperand(0), BB);
-    intersectAssumeOrGuardBlockValueConstantRange(BBI->getOperand(0), LHSVal,
-                                                  BBI);
+  if (hasBlockValue(BO->getOperand(0), BB)) {
+    LVILatticeVal LHSVal = getBlockValue(BO->getOperand(0), BB);
+    intersectAssumeOrGuardBlockValueConstantRange(BO->getOperand(0), LHSVal,
+                                                  BO);
     if (LHSVal.isConstantRange())
       LHSRange = LHSVal.getConstantRange();
   }
 
-  ConstantInt *RHS = cast<ConstantInt>(BBI->getOperand(1));
+  ConstantInt *RHS = cast<ConstantInt>(BO->getOperand(1));
   ConstantRange RHSRange = ConstantRange(RHS->getValue());
 
   // NOTE: We're currently limited by the set of operations that ConstantRange
   // can evaluate symbolically.  Enhancing that set will allows us to analyze
   // more definitions.
-  auto BinOp = (Instruction::BinaryOps) BBI->getOpcode();
+  Instruction::BinaryOps BinOp = BO->getOpcode();
   BBLV = LVILatticeVal::getRange(LHSRange.binaryOp(BinOp, RHSRange));
   return true;
 }
@@ -1292,12 +1334,12 @@ getValueFromConditionImpl(Value *Val, Value *Cond, bool isTrueDest,
     return getValueFromICmpCondition(Val, ICI, isTrueDest);
 
   // Handle conditions in the form of (cond1 && cond2), we know that on the
-  // true dest path both of the conditions hold.
-  if (!isTrueDest)
-    return LVILatticeVal::getOverdefined();
-
+  // true dest path both of the conditions hold. Similarly for conditions of
+  // the form (cond1 || cond2), we know that on the false dest path neither
+  // condition holds.
   BinaryOperator *BO = dyn_cast<BinaryOperator>(Cond);
-  if (!BO || BO->getOpcode() != BinaryOperator::And)
+  if (!BO || (isTrueDest && BO->getOpcode() != BinaryOperator::And) ||
+             (!isTrueDest && BO->getOpcode() != BinaryOperator::Or))
     return LVILatticeVal::getOverdefined();
 
   auto RHS = getValueFromCondition(Val, BO->getOperand(0), isTrueDest, Visited);
@@ -1323,6 +1365,51 @@ LVILatticeVal getValueFromCondition(Value *Val, Value *Cond, bool isTrueDest) {
   return getValueFromCondition(Val, Cond, isTrueDest, Visited);
 }
 
+// Return true if Usr has Op as an operand, otherwise false.
+static bool usesOperand(User *Usr, Value *Op) {
+  return find(Usr->operands(), Op) != Usr->op_end();
+}
+
+// Return true if the instruction type of Val is supported by
+// constantFoldUser(). Currently CastInst and BinaryOperator only.  Call this
+// before calling constantFoldUser() to find out if it's even worth attempting
+// to call it.
+static bool isOperationFoldable(User *Usr) {
+  return isa<CastInst>(Usr) || isa<BinaryOperator>(Usr);
+}
+
+// Check if Usr can be simplified to an integer constant when the value of one
+// of its operands Op is an integer constant OpConstVal. If so, return it as an
+// lattice value range with a single element or otherwise return an overdefined
+// lattice value.
+static LVILatticeVal constantFoldUser(User *Usr, Value *Op,
+                                      const APInt &OpConstVal,
+                                      const DataLayout &DL) {
+  assert(isOperationFoldable(Usr) && "Precondition");
+  Constant* OpConst = Constant::getIntegerValue(Op->getType(), OpConstVal);
+  // Check if Usr can be simplified to a constant.
+  if (auto *CI = dyn_cast<CastInst>(Usr)) {
+    assert(CI->getOperand(0) == Op && "Operand 0 isn't Op");
+    if (auto *C = dyn_cast_or_null<ConstantInt>(
+            SimplifyCastInst(CI->getOpcode(), OpConst,
+                             CI->getDestTy(), DL))) {
+      return LVILatticeVal::getRange(ConstantRange(C->getValue()));
+    }
+  } else if (auto *BO = dyn_cast<BinaryOperator>(Usr)) {
+    bool Op0Match = BO->getOperand(0) == Op;
+    bool Op1Match = BO->getOperand(1) == Op;
+    assert((Op0Match || Op1Match) &&
+           "Operand 0 nor Operand 1 isn't a match");
+    Value *LHS = Op0Match ? OpConst : BO->getOperand(0);
+    Value *RHS = Op1Match ? OpConst : BO->getOperand(1);
+    if (auto *C = dyn_cast_or_null<ConstantInt>(
+            SimplifyBinOp(BO->getOpcode(), LHS, RHS, DL))) {
+      return LVILatticeVal::getRange(ConstantRange(C->getValue()));
+    }
+  }
+  return LVILatticeVal::getOverdefined();
+}
+
 /// \brief Compute the value of Val on the edge BBFrom -> BBTo. Returns false if
 /// Val is not constrained on the edge.  Result is unspecified if return value
 /// is false.
@@ -1338,10 +1425,11 @@ static bool getEdgeValueLocal(Value *Val, BasicBlock *BBFrom,
       bool isTrueDest = BI->getSuccessor(0) == BBTo;
       assert(BI->getSuccessor(!isTrueDest) == BBTo &&
              "BBTo isn't a successor of BBFrom");
+      Value *Condition = BI->getCondition();
 
       // If V is the condition of the branch itself, then we know exactly what
       // it is.
-      if (BI->getCondition() == Val) {
+      if (Condition == Val) {
         Result = LVILatticeVal::get(ConstantInt::get(
                               Type::getInt1Ty(Val->getContext()), isTrueDest));
         return true;
@@ -1349,7 +1437,47 @@ static bool getEdgeValueLocal(Value *Val, BasicBlock *BBFrom,
 
       // If the condition of the branch is an equality comparison, we may be
       // able to infer the value.
-      Result = getValueFromCondition(Val, BI->getCondition(), isTrueDest);
+      Result = getValueFromCondition(Val, Condition, isTrueDest);
+      if (!Result.isOverdefined())
+        return true;
+
+      if (User *Usr = dyn_cast<User>(Val)) {
+        assert(Result.isOverdefined() && "Result isn't overdefined");
+        // Check with isOperationFoldable() first to avoid linearly iterating
+        // over the operands unnecessarily which can be expensive for
+        // instructions with many operands.
+        if (isa<IntegerType>(Usr->getType()) && isOperationFoldable(Usr)) {
+          const DataLayout &DL = BBTo->getModule()->getDataLayout();
+          if (usesOperand(Usr, Condition)) {
+            // If Val has Condition as an operand and Val can be folded into a
+            // constant with either Condition == true or Condition == false,
+            // propagate the constant.
+            // eg.
+            //   ; %Val is true on the edge to %then.
+            //   %Val = and i1 %Condition, true.
+            //   br %Condition, label %then, label %else
+            APInt ConditionVal(1, isTrueDest ? 1 : 0);
+            Result = constantFoldUser(Usr, Condition, ConditionVal, DL);
+          } else {
+            // If one of Val's operand has an inferred value, we may be able to
+            // infer the value of Val.
+            // eg.
+            //    ; %Val is 94 on the edge to %then.
+            //    %Val = add i8 %Op, 1
+            //    %Condition = icmp eq i8 %Op, 93
+            //    br i1 %Condition, label %then, label %else
+            for (unsigned i = 0; i < Usr->getNumOperands(); ++i) {
+              Value *Op = Usr->getOperand(i);
+              LVILatticeVal OpLatticeVal =
+                  getValueFromCondition(Op, Condition, isTrueDest);
+              if (Optional<APInt> OpConst = OpLatticeVal.asConstantInteger()) {
+                Result = constantFoldUser(Usr, Op, OpConst.getValue(), DL);
+                break;
+              }
+            }
+          }
+        }
+      }
       if (!Result.isOverdefined())
         return true;
     }
@@ -1358,21 +1486,47 @@ static bool getEdgeValueLocal(Value *Val, BasicBlock *BBFrom,
   // If the edge was formed by a switch on the value, then we may know exactly
   // what it is.
   if (SwitchInst *SI = dyn_cast<SwitchInst>(BBFrom->getTerminator())) {
-    if (SI->getCondition() != Val)
+    Value *Condition = SI->getCondition();
+    if (!isa<IntegerType>(Val->getType()))
       return false;
+    bool ValUsesConditionAndMayBeFoldable = false;
+    if (Condition != Val) {
+      // Check if Val has Condition as an operand.
+      if (User *Usr = dyn_cast<User>(Val))
+        ValUsesConditionAndMayBeFoldable = isOperationFoldable(Usr) &&
+            usesOperand(Usr, Condition);
+      if (!ValUsesConditionAndMayBeFoldable)
+        return false;
+    }
+    assert((Condition == Val || ValUsesConditionAndMayBeFoldable) &&
+           "Condition != Val nor Val doesn't use Condition");
 
     bool DefaultCase = SI->getDefaultDest() == BBTo;
     unsigned BitWidth = Val->getType()->getIntegerBitWidth();
     ConstantRange EdgesVals(BitWidth, DefaultCase/*isFullSet*/);
 
-    for (SwitchInst::CaseIt i : SI->cases()) {
-      ConstantRange EdgeVal(i.getCaseValue()->getValue());
+    for (auto Case : SI->cases()) {
+      APInt CaseValue = Case.getCaseValue()->getValue();
+      ConstantRange EdgeVal(CaseValue);
+      if (ValUsesConditionAndMayBeFoldable) {
+        User *Usr = cast<User>(Val);
+        const DataLayout &DL = BBTo->getModule()->getDataLayout();
+        LVILatticeVal EdgeLatticeVal =
+            constantFoldUser(Usr, Condition, CaseValue, DL);
+        if (EdgeLatticeVal.isOverdefined())
+          return false;
+        EdgeVal = EdgeLatticeVal.getConstantRange();
+      }
       if (DefaultCase) {
         // It is possible that the default destination is the destination of
-        // some cases. There is no need to perform difference for those cases.
-        if (i.getCaseSuccessor() != BBTo)
+        // some cases. We cannot perform difference for those cases.
+        // We know Condition != CaseValue in BBTo.  In some cases we can use
+        // this to infer Val == f(Condition) is != f(CaseValue).  For now, we
+        // only do this when f is identity (i.e. Val == Condition), but we
+        // should be able to do this for any injective f.
+        if (Case.getCaseSuccessor() != BBTo && Condition == Val)
           EdgesVals = EdgesVals.difference(EdgeVal);
-      } else if (i.getCaseSuccessor() == BBTo)
+      } else if (Case.getCaseSuccessor() == BBTo)
         EdgesVals = EdgesVals.unionWith(EdgeVal);
     }
     Result = LVILatticeVal::getRange(std::move(EdgesVals));
@@ -1584,7 +1738,7 @@ Constant *LazyValueInfo::getConstant(Value *V, BasicBlock *BB,
   if (Result.isConstant())
     return Result.getConstant();
   if (Result.isConstantRange()) {
-    ConstantRange CR = Result.getConstantRange();
+    const ConstantRange &CR = Result.getConstantRange();
     if (const APInt *SingleVal = CR.getSingleElement())
       return ConstantInt::get(V->getContext(), *SingleVal);
   }
@@ -1621,71 +1775,90 @@ Constant *LazyValueInfo::getConstantOnEdge(Value *V, BasicBlock *FromBB,
   if (Result.isConstant())
     return Result.getConstant();
   if (Result.isConstantRange()) {
-    ConstantRange CR = Result.getConstantRange();
+    const ConstantRange &CR = Result.getConstantRange();
     if (const APInt *SingleVal = CR.getSingleElement())
       return ConstantInt::get(V->getContext(), *SingleVal);
   }
   return nullptr;
 }
 
+ConstantRange LazyValueInfo::getConstantRangeOnEdge(Value *V,
+                                                    BasicBlock *FromBB,
+                                                    BasicBlock *ToBB,
+                                                    Instruction *CxtI) {
+  unsigned Width = V->getType()->getIntegerBitWidth();
+  const DataLayout &DL = FromBB->getModule()->getDataLayout();
+  LVILatticeVal Result =
+      getImpl(PImpl, AC, &DL, DT).getValueOnEdge(V, FromBB, ToBB, CxtI);
+
+  if (Result.isUndefined())
+    return ConstantRange(Width, /*isFullSet=*/false);
+  if (Result.isConstantRange())
+    return Result.getConstantRange();
+  // We represent ConstantInt constants as constant ranges but other kinds
+  // of integer constants, i.e. ConstantExpr will be tagged as constants
+  assert(!(Result.isConstant() && isa<ConstantInt>(Result.getConstant())) &&
+         "ConstantInt value must be represented as constantrange");
+  return ConstantRange(Width, /*isFullSet=*/true);
+}
+
 static LazyValueInfo::Tristate getPredicateResult(unsigned Pred, Constant *C,
-                                                  LVILatticeVal &Result,
+                                                  const LVILatticeVal &Val,
                                                   const DataLayout &DL,
                                                   TargetLibraryInfo *TLI) {
 
   // If we know the value is a constant, evaluate the conditional.
   Constant *Res = nullptr;
-  if (Result.isConstant()) {
-    Res = ConstantFoldCompareInstOperands(Pred, Result.getConstant(), C, DL,
-                                          TLI);
+  if (Val.isConstant()) {
+    Res = ConstantFoldCompareInstOperands(Pred, Val.getConstant(), C, DL, TLI);
     if (ConstantInt *ResCI = dyn_cast<ConstantInt>(Res))
       return ResCI->isZero() ? LazyValueInfo::False : LazyValueInfo::True;
     return LazyValueInfo::Unknown;
   }
 
-  if (Result.isConstantRange()) {
+  if (Val.isConstantRange()) {
     ConstantInt *CI = dyn_cast<ConstantInt>(C);
     if (!CI) return LazyValueInfo::Unknown;
 
-    ConstantRange CR = Result.getConstantRange();
+    const ConstantRange &CR = Val.getConstantRange();
     if (Pred == ICmpInst::ICMP_EQ) {
       if (!CR.contains(CI->getValue()))
         return LazyValueInfo::False;
 
-      if (CR.isSingleElement() && CR.contains(CI->getValue()))
+      if (CR.isSingleElement())
         return LazyValueInfo::True;
     } else if (Pred == ICmpInst::ICMP_NE) {
       if (!CR.contains(CI->getValue()))
         return LazyValueInfo::True;
 
-      if (CR.isSingleElement() && CR.contains(CI->getValue()))
+      if (CR.isSingleElement())
+        return LazyValueInfo::False;
+    } else {
+      // Handle more complex predicates.
+      ConstantRange TrueValues = ConstantRange::makeExactICmpRegion(
+          (ICmpInst::Predicate)Pred, CI->getValue());
+      if (TrueValues.contains(CR))
+        return LazyValueInfo::True;
+      if (TrueValues.inverse().contains(CR))
         return LazyValueInfo::False;
     }
-
-    // Handle more complex predicates.
-    ConstantRange TrueValues = ConstantRange::makeExactICmpRegion(
-        (ICmpInst::Predicate)Pred, CI->getValue());
-    if (TrueValues.contains(CR))
-      return LazyValueInfo::True;
-    if (TrueValues.inverse().contains(CR))
-      return LazyValueInfo::False;
     return LazyValueInfo::Unknown;
   }
 
-  if (Result.isNotConstant()) {
+  if (Val.isNotConstant()) {
     // If this is an equality comparison, we can try to fold it knowing that
     // "V != C1".
     if (Pred == ICmpInst::ICMP_EQ) {
       // !C1 == C -> false iff C1 == C.
       Res = ConstantFoldCompareInstOperands(ICmpInst::ICMP_NE,
-                                            Result.getNotConstant(), C, DL,
+                                            Val.getNotConstant(), C, DL,
                                             TLI);
       if (Res->isNullValue())
         return LazyValueInfo::False;
     } else if (Pred == ICmpInst::ICMP_NE) {
       // !C1 != C -> true iff C1 == C.
       Res = ConstantFoldCompareInstOperands(ICmpInst::ICMP_NE,
-                                            Result.getNotConstant(), C, DL,
+                                            Val.getNotConstant(), C, DL,
                                             TLI);
       if (Res->isNullValue())
         return LazyValueInfo::True;
@@ -1713,17 +1886,17 @@ LazyValueInfo::Tristate
 LazyValueInfo::getPredicateAt(unsigned Pred, Value *V, Constant *C,
                               Instruction *CxtI) {
   // Is or is not NonNull are common predicates being queried. If
-  // isKnownNonNull can tell us the result of the predicate, we can
+  // isKnownNonZero can tell us the result of the predicate, we can
   // return it quickly. But this is only a fastpath, and falling
   // through would still be correct.
+  const DataLayout &DL = CxtI->getModule()->getDataLayout();
   if (V->getType()->isPointerTy() && C->isNullValue() &&
-      isKnownNonNull(V->stripPointerCasts())) {
+      isKnownNonZero(V->stripPointerCasts(), DL)) {
     if (Pred == ICmpInst::ICMP_EQ)
       return LazyValueInfo::False;
     else if (Pred == ICmpInst::ICMP_NE)
       return LazyValueInfo::True;
   }
-  const DataLayout &DL = CxtI->getModule()->getDataLayout();
   LVILatticeVal Result = getImpl(PImpl, AC, &DL, DT).getValueAt(V, CxtI);
   Tristate Ret = getPredicateResult(Pred, C, Result, DL, TLI);
   if (Ret != Unknown)
@@ -1824,3 +1997,97 @@ void LazyValueInfo::eraseBlock(BasicBlock *BB) {
     getImpl(PImpl, AC, &DL, DT).eraseBlock(BB);
   }
 }
+
+
+void LazyValueInfo::printLVI(Function &F, DominatorTree &DTree, raw_ostream &OS) {
+  if (PImpl) {
+    getImpl(PImpl, AC, DL, DT).printLVI(F, DTree, OS);
+  }
+}
+
+// Print the LVI for the function arguments at the start of each basic block.
+void LazyValueInfoAnnotatedWriter::emitBasicBlockStartAnnot(
+    const BasicBlock *BB, formatted_raw_ostream &OS) {
+  // Find if there are latticevalues defined for arguments of the function.
+  auto *F = BB->getParent();
+  for (auto &Arg : F->args()) {
+    LVILatticeVal Result = LVIImpl->getValueInBlock(
+        const_cast<Argument *>(&Arg), const_cast<BasicBlock *>(BB));
+    if (Result.isUndefined())
+      continue;
+    OS << "; LatticeVal for: '" << Arg << "' is: " << Result << "\n";
+  }
+}
+
+// This function prints the LVI analysis for the instruction I at the beginning
+// of various basic blocks. It relies on calculated values that are stored in
+// the LazyValueInfoCache, and in the absence of cached values, recalculte the
+// LazyValueInfo for `I`, and print that info.
+void LazyValueInfoAnnotatedWriter::emitInstructionAnnot(
+    const Instruction *I, formatted_raw_ostream &OS) {
+
+  auto *ParentBB = I->getParent();
+  SmallPtrSet<const BasicBlock*, 16> BlocksContainingLVI;
+  // We can generate (solve) LVI values only for blocks that are dominated by
+  // the I's parent. However, to avoid generating LVI for all dominating blocks,
+  // that contain redundant/uninteresting information, we print LVI for
+  // blocks that may use this LVI information (such as immediate successor
+  // blocks, and blocks that contain uses of `I`).
+  auto printResult = [&](const BasicBlock *BB) {
+    if (!BlocksContainingLVI.insert(BB).second)
+      return;
+    LVILatticeVal Result = LVIImpl->getValueInBlock(
+        const_cast<Instruction *>(I), const_cast<BasicBlock *>(BB));
+      OS << "; LatticeVal for: '" << *I << "' in BB: '";
+      BB->printAsOperand(OS, false);
+      OS << "' is: " << Result << "\n";
+  };
+
+  printResult(ParentBB);
+  // Print the LVI analysis results for the the immediate successor blocks, that
+  // are dominated by `ParentBB`.
+  for (auto *BBSucc : successors(ParentBB))
+    if (DT.dominates(ParentBB, BBSucc))
+      printResult(BBSucc);
+
+  // Print LVI in blocks where `I` is used.
+  for (auto *U : I->users())
+    if (auto *UseI = dyn_cast<Instruction>(U))
+      if (!isa<PHINode>(UseI) || DT.dominates(ParentBB, UseI->getParent()))
+        printResult(UseI->getParent());
+
+}
+
+namespace {
+// Printer class for LazyValueInfo results.
+class LazyValueInfoPrinter : public FunctionPass {
+public:
+  static char ID; // Pass identification, replacement for typeid
+  LazyValueInfoPrinter() : FunctionPass(ID) {
+    initializeLazyValueInfoPrinterPass(*PassRegistry::getPassRegistry());
+  }
+
+  void getAnalysisUsage(AnalysisUsage &AU) const override {
+    AU.setPreservesAll();
+    AU.addRequired<LazyValueInfoWrapperPass>();
+    AU.addRequired<DominatorTreeWrapperPass>();
+  }
+
+  // Get the mandatory dominator tree analysis and pass this in to the
+  // LVIPrinter. We cannot rely on the LVI's DT, since it's optional.
+  bool runOnFunction(Function &F) override {
+    dbgs() << "LVI for function '" << F.getName() << "':\n";
+    auto &LVI = getAnalysis<LazyValueInfoWrapperPass>().getLVI();
+    auto &DTree = getAnalysis<DominatorTreeWrapperPass>().getDomTree();
+    LVI.printLVI(F, DTree, dbgs());
+    return false;
+  }
+};
+}
+
+char LazyValueInfoPrinter::ID = 0;
+INITIALIZE_PASS_BEGIN(LazyValueInfoPrinter, "print-lazy-value-info",
+                "Lazy Value Info Printer Pass", false, false)
+INITIALIZE_PASS_DEPENDENCY(LazyValueInfoWrapperPass)
+INITIALIZE_PASS_END(LazyValueInfoPrinter, "print-lazy-value-info",
+                "Lazy Value Info Printer Pass", false, false)

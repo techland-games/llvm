@@ -1,4 +1,4 @@
-; RUN: llc -march=amdgcn -mcpu=tonga -verify-machineinstrs < %s | FileCheck %s
+; RUN:  llc -amdgpu-scalarize-global-loads=false  -march=amdgcn -mcpu=tonga -verify-machineinstrs < %s | FileCheck %s
 ; CHECK-DAG: flat_load_dwordx4
 ; CHECK-DAG: flat_load_dwordx4
 ; CHECK-DAG: flat_load_dwordx4
@@ -12,7 +12,7 @@
 ; CHECK-DAG: ds_write2_b32
 ; CHECK-DAG: ds_write2_b32
 
-define void @vectorize_global_local(i32 addrspace(1)* nocapture readonly %arg, i32 addrspace(3)* nocapture %arg1) {
+define amdgpu_kernel void @vectorize_global_local(i32 addrspace(1)* nocapture readonly %arg, i32 addrspace(3)* nocapture %arg1) {
 bb:
   %tmp = load i32, i32 addrspace(1)* %arg, align 4
   store i32 %tmp, i32 addrspace(3)* %arg1, align 4

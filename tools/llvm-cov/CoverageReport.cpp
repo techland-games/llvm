@@ -307,35 +307,33 @@ void CoverageReport::renderFunctionReports(ArrayRef<std::string> Files,
   }
 }
 
-std::vector<FileCoverageSummary>
-CoverageReport::prepareFileReports(const coverage::CoverageMapping &Coverage,
-                                   FileCoverageSummary &Totals,
-                                   ArrayRef<std::string> Files) {
+std::vector<FileCoverageSummary> CoverageReport::prepareFileReports(
+    const coverage::CoverageMapping &Coverage, FileCoverageSummary &Totals,
+    ArrayRef<std::string> Files, const CoverageViewOptions &Options) {
   std::vector<FileCoverageSummary> FileReports;
   unsigned LCP = getRedundantPrefixLen(Files);
 
   for (StringRef Filename : Files) {
     FileCoverageSummary Summary(Filename.drop_front(LCP));
 
-    // Map source locations to aggregate function coverage summaries.
-    DenseMap<std::pair<unsigned, unsigned>, FunctionCoverageSummary> Summaries;
+    for (const auto &Group : Coverage.getInstantiationGroups(Filename)) {
+      std::vector<FunctionCoverageSummary> InstantiationSummaries;
+      for (const coverage::FunctionRecord *F : Group.getInstantiations()) {
+        auto InstantiationSummary = FunctionCoverageSummary::get(*F);
+        Summary.addInstantiation(InstantiationSummary);
+        Totals.addInstantiation(InstantiationSummary);
+        InstantiationSummaries.push_back(InstantiationSummary);
+      }
 
-    for (const auto &F : Coverage.getCoveredFunctions(Filename)) {
-      FunctionCoverageSummary Function = FunctionCoverageSummary::get(F);
-      auto StartLoc = F.CountedRegions[0].startLoc();
+      auto GroupSummary =
+          FunctionCoverageSummary::get(Group, InstantiationSummaries);
 
-      auto UniquedSummary = Summaries.insert({StartLoc, Function});
-      if (!UniquedSummary.second)
-        UniquedSummary.first->second.update(Function);
+      if (Options.Debug)
+        outs() << "InstantiationGroup: " << GroupSummary.Name << " with "
+               << "size = " << Group.size() << "\n";
 
-      Summary.addInstantiation(Function);
-      Totals.addInstantiation(Function);
-    }
-
-    for (const auto &UniquedSummary : Summaries) {
-      const FunctionCoverageSummary &FCS = UniquedSummary.second;
-      Summary.addFunction(FCS);
-      Totals.addFunction(FCS);
+      Summary.addFunction(GroupSummary);
+      Totals.addFunction(GroupSummary);
     }
 
     FileReports.push_back(Summary);
@@ -354,7 +352,7 @@ void CoverageReport::renderFileReports(raw_ostream &OS) const {
 void CoverageReport::renderFileReports(raw_ostream &OS,
                                        ArrayRef<std::string> Files) const {
   FileCoverageSummary Totals("TOTAL");
-  auto FileReports = prepareFileReports(Coverage, Totals, Files);
+  auto FileReports = prepareFileReports(Coverage, Totals, Files, Options);
 
   std::vector<StringRef> Filenames;
   for (const FileCoverageSummary &FCS : FileReports)
@@ -377,8 +375,22 @@ void CoverageReport::renderFileReports(raw_ostream &OS,
   renderDivider(FileReportColumns, OS);
   OS << "\n";
 
-  for (const FileCoverageSummary &FCS : FileReports)
-    render(FCS, OS);
+  bool EmptyFiles = false;
+  for (const FileCoverageSummary &FCS : FileReports) {
+    if (FCS.FunctionCoverage.NumFunctions)
+      render(FCS, OS);
+    else
+      EmptyFiles = true;
+  }
+
+  if (EmptyFiles) {
+    OS << "\n"
+       << "Files which contain no functions:\n";
+
+    for (const FileCoverageSummary &FCS : FileReports)
+      if (!FCS.FunctionCoverage.NumFunctions)
+        render(FCS, OS);
+  }
 
   renderDivider(FileReportColumns, OS);
   OS << "\n";

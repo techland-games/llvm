@@ -105,10 +105,10 @@ namespace llvm {
           HonorSignDependentRoundingFPMathOption(false), NoZerosInBSS(false),
           GuaranteedTailCallOpt(false), StackSymbolOrdering(true),
           EnableFastISel(false), UseInitArray(false),
-          DisableIntegratedAS(false), CompressDebugSections(false),
-          RelaxELFRelocations(false), FunctionSections(false),
-          DataSections(false), UniqueSectionNames(true), TrapUnreachable(false),
-          EmulatedTLS(false), EnableIPRA(false) {}
+          DisableIntegratedAS(false), RelaxELFRelocations(false),
+          FunctionSections(false), DataSections(false),
+          UniqueSectionNames(true), TrapUnreachable(false), EmulatedTLS(false),
+          EnableIPRA(false) {}
 
     /// PrintMachineCode - This flag is enabled when the -print-machineinstrs
     /// option is specified on the command line, and should enable debugging
@@ -194,7 +194,7 @@ namespace llvm {
     unsigned DisableIntegratedAS : 1;
 
     /// Compress DWARF debug sections.
-    unsigned CompressDebugSections : 1;
+    DebugCompressionType CompressDebugSections = DebugCompressionType::None;
 
     unsigned RelaxELFRelocations : 1;
 
@@ -262,43 +262,6 @@ namespace llvm {
     /// Machine level options.
     MCTargetOptions MCOptions;
   };
-
-// Comparison operators:
-
-
-inline bool operator==(const TargetOptions &LHS,
-                       const TargetOptions &RHS) {
-#define ARE_EQUAL(X) LHS.X == RHS.X
-  return
-    ARE_EQUAL(UnsafeFPMath) &&
-    ARE_EQUAL(NoInfsFPMath) &&
-    ARE_EQUAL(NoNaNsFPMath) &&
-    ARE_EQUAL(NoTrappingFPMath) &&
-    ARE_EQUAL(NoSignedZerosFPMath) &&
-    ARE_EQUAL(HonorSignDependentRoundingFPMathOption) &&
-    ARE_EQUAL(NoZerosInBSS) &&
-    ARE_EQUAL(GuaranteedTailCallOpt) &&
-    ARE_EQUAL(StackAlignmentOverride) &&
-    ARE_EQUAL(EnableFastISel) &&
-    ARE_EQUAL(UseInitArray) &&
-    ARE_EQUAL(TrapUnreachable) &&
-    ARE_EQUAL(EmulatedTLS) &&
-    ARE_EQUAL(FloatABIType) &&
-    ARE_EQUAL(AllowFPOpFusion) &&
-    ARE_EQUAL(ThreadModel) &&
-    ARE_EQUAL(EABIVersion) &&
-    ARE_EQUAL(DebuggerTuning) &&
-    ARE_EQUAL(FPDenormalMode) &&
-    ARE_EQUAL(ExceptionModel) &&
-    ARE_EQUAL(MCOptions) &&
-    ARE_EQUAL(EnableIPRA);
-#undef ARE_EQUAL
-}
-
-inline bool operator!=(const TargetOptions &LHS,
-                       const TargetOptions &RHS) {
-  return !(LHS == RHS);
-}
 
 } // End llvm namespace
 

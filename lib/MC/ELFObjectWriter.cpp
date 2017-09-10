@@ -13,11 +13,13 @@
 
 #include "llvm/ADT/ArrayRef.h"
 #include "llvm/ADT/DenseMap.h"
+#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/SmallString.h"
 #include "llvm/ADT/SmallVector.h"
-#include "llvm/ADT/STLExtras.h"
 #include "llvm/ADT/StringRef.h"
 #include "llvm/ADT/Twine.h"
+#include "llvm/BinaryFormat/ELF.h"
+#include "llvm/MC/MCAsmBackend.h"
 #include "llvm/MC/MCAsmInfo.h"
 #include "llvm/MC/MCAsmLayout.h"
 #include "llvm/MC/MCAssembler.h"
@@ -25,6 +27,7 @@
 #include "llvm/MC/MCELFObjectWriter.h"
 #include "llvm/MC/MCExpr.h"
 #include "llvm/MC/MCFixup.h"
+#include "llvm/MC/MCFixupKindInfo.h"
 #include "llvm/MC/MCFragment.h"
 #include "llvm/MC/MCObjectWriter.h"
 #include "llvm/MC/MCSection.h"
@@ -36,7 +39,6 @@
 #include "llvm/Support/Allocator.h"
 #include "llvm/Support/Casting.h"
 #include "llvm/Support/Compression.h"
-#include "llvm/Support/ELF.h"
 #include "llvm/Support/Endian.h"
 #include "llvm/Support/Error.h"
 #include "llvm/Support/ErrorHandling.h"
@@ -63,7 +65,7 @@ using namespace llvm;
 
 namespace {
 
-typedef DenseMap<const MCSectionELF *, uint32_t> SectionIndexMapTy;
+using SectionIndexMapTy = DenseMap<const MCSectionELF *, uint32_t>;
 
 class ELFObjectWriter;
 
@@ -194,8 +196,8 @@ public:
                    ELFSymbolData &MSD, const MCAsmLayout &Layout);
 
   // Start and end offset of each section
-  typedef std::map<const MCSectionELF *, std::pair<uint64_t, uint64_t>>
-      SectionOffsetsTy;
+  using SectionOffsetsTy =
+      std::map<const MCSectionELF *, std::pair<uint64_t, uint64_t>>;
 
   bool shouldRelocateWithSymbol(const MCAssembler &Asm,
                                 const MCSymbolRefExpr *RefA,
@@ -204,11 +206,10 @@ public:
 
   void recordRelocation(MCAssembler &Asm, const MCAsmLayout &Layout,
                         const MCFragment *Fragment, const MCFixup &Fixup,
-                        MCValue Target, bool &IsPCRel,
-                        uint64_t &FixedValue) override;
+                        MCValue Target, uint64_t &FixedValue) override;
 
   // Map from a signature symbol to the group section index
-  typedef DenseMap<const MCSymbol *, unsigned> RevGroupMapTy;
+  using RevGroupMapTy = DenseMap<const MCSymbol *, unsigned>;
 
   /// Compute the symbol table data
   ///
@@ -247,8 +248,6 @@ public:
                                               const MCSymbol &SymA,
                                               const MCFragment &FB, bool InSet,
                                               bool IsPCRel) const override;
-
-  bool isWeak(const MCSymbol &Sym) const override;
 
   void writeObject(MCAssembler &Asm, const MCAsmLayout &Layout) override;
   void writeSection(const SectionIndexMapTy &SectionIndexMap,
@@ -628,16 +627,16 @@ void ELFObjectWriter::recordRelocation(MCAssembler &Asm,
                                        const MCAsmLayout &Layout,
                                        const MCFragment *Fragment,
                                        const MCFixup &Fixup, MCValue Target,
-                                       bool &IsPCRel, uint64_t &FixedValue) {
+                                       uint64_t &FixedValue) {
+  MCAsmBackend &Backend = Asm.getBackend();
+  bool IsPCRel = Backend.getFixupKindInfo(Fixup.getKind()).Flags &
+                 MCFixupKindInfo::FKF_IsPCRel;
   const MCSectionELF &FixupSection = cast<MCSectionELF>(*Fragment->getParent());
   uint64_t C = Target.getConstant();
   uint64_t FixupOffset = Layout.getFragmentOffset(Fragment) + Fixup.getOffset();
   MCContext &Ctx = Asm.getContext();
 
   if (const MCSymbolRefExpr *RefB = Target.getSymB()) {
-    assert(RefB->getKind() == MCSymbolRefExpr::VK_None &&
-           "Should not have constructed this");
-
     // Let A, B and C being the components of Target and R be the location of
     // the fixup. If the fixup is not pcrel, we want to compute (A - B + C).
     // If it is pcrel, we want to compute (A - B + C - R).
@@ -1022,17 +1021,23 @@ void ELFObjectWriter::writeSectionData(const MCAssembler &Asm, MCSection &Sec,
   MCSectionELF &Section = static_cast<MCSectionELF &>(Sec);
   StringRef SectionName = Section.getSectionName();
 
+  auto &MC = Asm.getContext();
+  const auto &MAI = MC.getAsmInfo();
+
   // Compressing debug_frame requires handling alignment fragments which is
   // more work (possibly generalizing MCAssembler.cpp:writeFragment to allow
   // for writing to arbitrary buffers) for little benefit.
   bool CompressionEnabled =
-      Asm.getContext().getAsmInfo()->compressDebugSections() !=
-      DebugCompressionType::DCT_None;
+      MAI->compressDebugSections() != DebugCompressionType::None;
   if (!CompressionEnabled || !SectionName.startswith(".debug_") ||
       SectionName == ".debug_frame") {
     Asm.writeSectionData(&Section, Layout);
     return;
   }
+
+  assert((MAI->compressDebugSections() == DebugCompressionType::Z ||
+          MAI->compressDebugSections() == DebugCompressionType::GNU) &&
+         "expected zlib or zlib-gnu style compression");
 
   SmallVector<char, 128> UncompressedData;
   raw_svector_ostream VecOS(UncompressedData);
@@ -1050,8 +1055,7 @@ void ELFObjectWriter::writeSectionData(const MCAssembler &Asm, MCSection &Sec,
     return;
   }
 
-  bool ZlibStyle = Asm.getContext().getAsmInfo()->compressDebugSections() ==
-                   DebugCompressionType::DCT_Zlib;
+  bool ZlibStyle = MAI->compressDebugSections() == DebugCompressionType::Z;
   if (!maybeWriteCompression(UncompressedData.size(), CompressedContents,
                              ZlibStyle, Sec.getAlignment())) {
     getStream() << UncompressedData;
@@ -1063,8 +1067,7 @@ void ELFObjectWriter::writeSectionData(const MCAssembler &Asm, MCSection &Sec,
     Section.setFlags(Section.getFlags() | ELF::SHF_COMPRESSED);
   else
     // Add "z" prefix to section name. This is zlib-gnu style.
-    Asm.getContext().renameELFSection(&Section,
-                                      (".z" + SectionName.drop_front(1)).str());
+    MC.renameELFSection(&Section, (".z" + SectionName.drop_front(1)).str());
   getStream() << CompressedContents;
 }
 
@@ -1359,32 +1362,11 @@ bool ELFObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(
   const auto &SymA = cast<MCSymbolELF>(SA);
   if (IsPCRel) {
     assert(!InSet);
-    if (::isWeak(SymA))
+    if (isWeak(SymA))
       return false;
   }
   return MCObjectWriter::isSymbolRefDifferenceFullyResolvedImpl(Asm, SymA, FB,
                                                                 InSet, IsPCRel);
-}
-
-bool ELFObjectWriter::isWeak(const MCSymbol &S) const {
-  const auto &Sym = cast<MCSymbolELF>(S);
-  if (::isWeak(Sym))
-    return true;
-
-  // It is invalid to replace a reference to a global in a comdat
-  // with a reference to a local since out of comdat references
-  // to a local are forbidden.
-  // We could try to return false for more cases, like the reference
-  // being in the same comdat or Sym being an alias to another global,
-  // but it is not clear if it is worth the effort.
-  if (Sym.getBinding() != ELF::STB_GLOBAL)
-    return false;
-
-  if (!Sym.isInSection())
-    return false;
-
-  const auto &Sec = cast<MCSectionELF>(Sym.getSection());
-  return Sec.getGroup();
 }
 
 MCObjectWriter *llvm::createELFObjectWriter(MCELFObjectTargetWriter *MOTW,

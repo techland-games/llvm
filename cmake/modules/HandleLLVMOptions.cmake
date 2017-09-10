@@ -8,7 +8,6 @@ string(TOUPPER "${CMAKE_BUILD_TYPE}" uppercase_CMAKE_BUILD_TYPE)
 
 include(CheckCompilerVersion)
 include(HandleLLVMStdlib)
-include(AddLLVMDefinitions)
 include(CheckCCompilerFlag)
 include(CheckCXXCompilerFlag)
 
@@ -17,6 +16,9 @@ if(CMAKE_LINKER MATCHES "lld-link.exe" OR (WIN32 AND LLVM_USE_LINKER STREQUAL "l
 else()
   set(LINKER_IS_LLD_LINK FALSE)
 endif()
+
+set(LLVM_ENABLE_LTO OFF CACHE STRING "Build LLVM with LTO. May be specified as Thin or Full to use a particular kind of LTO")
+string(TOUPPER "${LLVM_ENABLE_LTO}" uppercase_LLVM_ENABLE_LTO)
 
 # Ninja Job Pool support
 # The following only works with the Ninja generator in CMake >= 3.0.
@@ -33,15 +35,18 @@ endif()
 
 set(LLVM_PARALLEL_LINK_JOBS "" CACHE STRING
   "Define the maximum number of concurrent link jobs.")
-if(LLVM_PARALLEL_LINK_JOBS)
-  if(NOT CMAKE_MAKE_PROGRAM MATCHES "ninja")
-    message(WARNING "Job pooling is only available with Ninja generators.")
-  else()
+if(CMAKE_MAKE_PROGRAM MATCHES "ninja")
+  if(NOT LLVM_PARALLEL_LINK_JOBS AND uppercase_LLVM_ENABLE_LTO STREQUAL "THIN")
+    message(STATUS "ThinLTO provides its own parallel linking - limiting parallel link jobs to 2.")
+    set(LLVM_PARALLEL_LINK_JOBS "2")
+  endif()
+  if(LLVM_PARALLEL_LINK_JOBS)
     set_property(GLOBAL APPEND PROPERTY JOB_POOLS link_job_pool=${LLVM_PARALLEL_LINK_JOBS})
     set(CMAKE_JOB_POOL_LINK link_job_pool)
   endif()
+elseif(LLVM_PARALLEL_LINK_JOBS)
+  message(WARNING "Job pooling is only available with Ninja generators.")
 endif()
-
 
 if (LINKER_IS_LLD_LINK)
   # Pass /MANIFEST:NO so that CMake doesn't run mt.exe on our binaries.  Adding
@@ -94,6 +99,10 @@ elseif( NOT DEFINED LLVM_ABI_BREAKING_CHECKS )
   # defined.
 else()
   message(FATAL_ERROR "Unknown value for LLVM_ABI_BREAKING_CHECKS: \"${LLVM_ABI_BREAKING_CHECKS}\"!")
+endif()
+
+if( LLVM_REVERSE_ITERATION )
+  set( LLVM_ENABLE_REVERSE_ITERATION 1 )
 endif()
 
 if(WIN32)
@@ -223,6 +232,17 @@ if( CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT WIN32 )
   endif( LLVM_BUILD_32_BITS )
 endif( CMAKE_SIZEOF_VOID_P EQUAL 8 AND NOT WIN32 )
 
+# If building on a GNU specific 32-bit system, make sure off_t is 64 bits
+# so that off_t can stored offset > 2GB.
+# Android until version N (API 24) doesn't support it.
+if (ANDROID AND (ANDROID_NATIVE_API_LEVEL LESS 24))
+  set(LLVM_FORCE_SMALLFILE_FOR_ANDROID TRUE)
+endif()
+if( CMAKE_SIZEOF_VOID_P EQUAL 4 AND NOT LLVM_FORCE_SMALLFILE_FOR_ANDROID)
+  add_definitions( -D_LARGEFILE_SOURCE )
+  add_definitions( -D_FILE_OFFSET_BITS=64 )
+endif()
+
 if( XCODE )
   # For Xcode enable several build settings that correspond to
   # many warnings that are on by default in Clang but are
@@ -253,10 +273,10 @@ if( MSVC_IDE )
     "Number of parallel compiler jobs. 0 means use all processors. Default is 0.")
   if( NOT LLVM_COMPILER_JOBS STREQUAL "1" )
     if( LLVM_COMPILER_JOBS STREQUAL "0" )
-      add_llvm_definitions( /MP )
+      add_definitions( /MP )
     else()
       message(STATUS "Number of parallel compiler jobs set to " ${LLVM_COMPILER_JOBS})
-      add_llvm_definitions( /MP${LLVM_COMPILER_JOBS} )
+      add_definitions( /MP${LLVM_COMPILER_JOBS} )
     endif()
   else()
     message(STATUS "Parallel compilation disabled")
@@ -285,17 +305,17 @@ if( MSVC )
   if( CMAKE_CXX_COMPILER_VERSION VERSION_LESS 19.0 )
     # For MSVC 2013, disable iterator null pointer checking in debug mode,
     # especially so std::equal(nullptr, nullptr, nullptr) will not assert.
-    add_llvm_definitions("-D_DEBUG_POINTER_IMPL=")
+    add_definitions("-D_DEBUG_POINTER_IMPL=")
   endif()
-  
+
   include(ChooseMSVCCRT)
 
   if( MSVC11 )
-    add_llvm_definitions(-D_VARIADIC_MAX=10)
+    add_definitions(-D_VARIADIC_MAX=10)
   endif()
-  
+
   # Add definitions that make MSVC much less annoying.
-  add_llvm_definitions(
+  add_definitions(
     # For some reason MS wants to deprecate a bunch of standard functions...
     -D_CRT_SECURE_NO_DEPRECATE
     -D_CRT_SECURE_NO_WARNINGS
@@ -306,7 +326,7 @@ if( MSVC )
     )
 
   # Tell MSVC to use the Unicode version of the Win32 APIs instead of ANSI.
-  add_llvm_definitions(
+  add_definitions(
     -DUNICODE
     -D_UNICODE
   )
@@ -354,7 +374,7 @@ if( MSVC )
 
       string(FIND "${upper_exe_flags} ${upper_module_flags} ${upper_shared_flags}"
         "/INCREMENTAL" linker_flag_idx)
-      
+
       if (${linker_flag_idx} GREATER -1)
         message(WARNING "/Brepro not compatible with /INCREMENTAL linking - builds will be non-deterministic")
       else()
@@ -365,10 +385,15 @@ if( MSVC )
 
 elseif( LLVM_COMPILER_IS_GCC_COMPATIBLE )
   append_if(LLVM_ENABLE_WERROR "-Werror" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+  append_if(LLVM_ENABLE_WERROR "-Wno-error" CMAKE_REQUIRED_FLAGS)
   add_flag_if_supported("-Werror=date-time" WERROR_DATE_TIME)
+  add_flag_if_supported("-Werror=unguarded-availability-new" WERROR_UNGUARDED_AVAILABILITY_NEW)
   if (LLVM_ENABLE_CXX1Y)
     check_cxx_compiler_flag("-std=c++1y" CXX_SUPPORTS_CXX1Y)
     append_if(CXX_SUPPORTS_CXX1Y "-std=c++1y" CMAKE_CXX_FLAGS)
+  elseif(LLVM_ENABLE_CXX1Z)
+    check_cxx_compiler_flag("-std=c++1z" CXX_SUPPORTS_CXX1Z)
+    append_if(CXX_SUPPORTS_CXX1Z "-std=c++1z" CMAKE_CXX_FLAGS)
   else()
     check_cxx_compiler_flag("-std=c++11" CXX_SUPPORTS_CXX11)
     if (CXX_SUPPORTS_CXX11)
@@ -562,6 +587,10 @@ if (LLVM_ENABLE_WARNINGS AND (LLVM_COMPILER_IS_GCC_COMPATIBLE OR CLANG_CL))
   add_flag_if_supported("-Wstring-conversion" STRING_CONVERSION_FLAG)
 endif (LLVM_ENABLE_WARNINGS AND (LLVM_COMPILER_IS_GCC_COMPATIBLE OR CLANG_CL))
 
+if (LLVM_COMPILER_IS_GCC_COMPATIBLE AND NOT LLVM_ENABLE_WARNINGS)
+  append("-w" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+endif()
+
 macro(append_common_sanitizer_flags)
   if (NOT MSVC)
     # Append -fno-omit-frame-pointer and turn on debug info to get better
@@ -619,6 +648,9 @@ if(LLVM_USE_SANITIZER)
       append_common_sanitizer_flags()
       append("-fsanitize=address,undefined -fno-sanitize=vptr,function -fno-sanitize-recover=all"
               CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+    elseif (LLVM_USE_SANITIZER STREQUAL "Leaks")
+      append_common_sanitizer_flags()
+      append("-fsanitize=leak" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
     else()
       message(FATAL_ERROR "Unsupported value of LLVM_USE_SANITIZER: ${LLVM_USE_SANITIZER}")
     endif()
@@ -637,7 +669,7 @@ if(LLVM_USE_SANITIZER)
                           FSANITIZE_USE_AFTER_SCOPE_FLAG)
   endif()
   if (LLVM_USE_SANITIZE_COVERAGE)
-    append("-fsanitize-coverage=trace-pc-guard,indirect-calls,trace-cmp" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
+    append("-fsanitize=fuzzer-no-link" CMAKE_C_FLAGS CMAKE_CXX_FLAGS)
   endif()
 endif()
 
@@ -646,9 +678,9 @@ if(LLVM_USE_SPLIT_DWARF)
   add_definitions("-gsplit-dwarf")
 endif()
 
-add_llvm_definitions( -D__STDC_CONSTANT_MACROS )
-add_llvm_definitions( -D__STDC_FORMAT_MACROS )
-add_llvm_definitions( -D__STDC_LIMIT_MACROS )
+add_definitions( -D__STDC_CONSTANT_MACROS )
+add_definitions( -D__STDC_FORMAT_MACROS )
+add_definitions( -D__STDC_LIMIT_MACROS )
 
 # clang doesn't print colored diagnostics when invoked from Ninja
 if (UNIX AND
@@ -660,8 +692,8 @@ endif()
 # lld doesn't print colored diagnostics when invoked from Ninja
 if (UNIX AND CMAKE_GENERATOR STREQUAL "Ninja")
   include(CheckLinkerFlag)
-  check_linker_flag("-Wl,-color-diagnostics" LINKER_SUPPORTS_COLOR_DIAGNOSTICS)
-  append_if(LINKER_SUPPORTS_COLOR_DIAGNOSTICS "-Wl,-color-diagnostics"
+  check_linker_flag("-Wl,--color-diagnostics" LINKER_SUPPORTS_COLOR_DIAGNOSTICS)
+  append_if(LINKER_SUPPORTS_COLOR_DIAGNOSTICS "-Wl,--color-diagnostics"
     CMAKE_EXE_LINKER_FLAGS CMAKE_MODULE_LINKER_FLAGS CMAKE_SHARED_LINKER_FLAGS)
 endif()
 
@@ -714,8 +746,6 @@ append_if(LLVM_BUILD_INSTRUMENTED_COVERAGE "-fprofile-instr-generate='${LLVM_PRO
   CMAKE_EXE_LINKER_FLAGS
   CMAKE_SHARED_LINKER_FLAGS)
 
-set(LLVM_ENABLE_LTO OFF CACHE STRING "Build LLVM with LTO. May be specified as Thin or Full to use a particular kind of LTO")
-string(TOUPPER "${LLVM_ENABLE_LTO}" uppercase_LLVM_ENABLE_LTO)
 if(LLVM_ENABLE_LTO AND LLVM_ON_WIN32 AND NOT LINKER_IS_LLD_LINK)
   message(FATAL_ERROR "When compiling for Windows, LLVM_ENABLE_LTO requires using lld as the linker (point CMAKE_LINKER at lld-link.exe)")
 endif()
@@ -766,7 +796,7 @@ endif()
 # Plugin support
 # FIXME: Make this configurable.
 if(WIN32 OR CYGWIN)
-  if(BUILD_SHARED_LIBS)
+  if(BUILD_SHARED_LIBS OR LLVM_BUILD_LLVM_DYLIB)
     set(LLVM_ENABLE_PLUGINS ON)
   else()
     set(LLVM_ENABLE_PLUGINS OFF)
@@ -774,3 +804,16 @@ if(WIN32 OR CYGWIN)
 else()
   set(LLVM_ENABLE_PLUGINS ON)
 endif()
+
+function(get_compile_definitions)
+  get_directory_property(top_dir_definitions DIRECTORY ${CMAKE_SOURCE_DIR} COMPILE_DEFINITIONS)
+  foreach(definition ${top_dir_definitions})
+    if(DEFINED result)
+      string(APPEND result " -D${definition}")
+    else()
+      set(result "-D${definition}")
+    endif()
+  endforeach()
+  set(LLVM_DEFINITIONS "${result}" PARENT_SCOPE)
+endfunction()
+get_compile_definitions()

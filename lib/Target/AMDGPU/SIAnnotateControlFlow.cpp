@@ -1,4 +1,4 @@
-//===-- SIAnnotateControlFlow.cpp -  ------------------===//
+//===- SIAnnotateControlFlow.cpp ------------------------------------------===//
 //
 //                     The LLVM Compiler Infrastructure
 //
@@ -14,15 +14,32 @@
 
 #include "AMDGPU.h"
 #include "llvm/ADT/DepthFirstIterator.h"
+#include "llvm/ADT/STLExtras.h"
+#include "llvm/ADT/SmallVector.h"
 #include "llvm/Analysis/DivergenceAnalysis.h"
 #include "llvm/Analysis/LoopInfo.h"
+#include "llvm/IR/BasicBlock.h"
+#include "llvm/IR/CFG.h"
+#include "llvm/IR/Constant.h"
 #include "llvm/IR/Constants.h"
+#include "llvm/IR/DerivedTypes.h"
 #include "llvm/IR/Dominators.h"
+#include "llvm/IR/Function.h"
+#include "llvm/IR/Instruction.h"
 #include "llvm/IR/Instructions.h"
+#include "llvm/IR/Intrinsics.h"
 #include "llvm/IR/Module.h"
+#include "llvm/IR/Type.h"
+#include "llvm/IR/ValueHandle.h"
 #include "llvm/Pass.h"
+#include "llvm/Support/Casting.h"
+#include "llvm/Support/Debug.h"
+#include "llvm/Support/ErrorHandling.h"
+#include "llvm/Support/raw_ostream.h"
 #include "llvm/Transforms/Utils/BasicBlockUtils.h"
-#include "llvm/Transforms/Utils/SSAUpdater.h"
+#include "llvm/Transforms/Utils/Local.h"
+#include <cassert>
+#include <utility>
 
 using namespace llvm;
 
@@ -31,8 +48,8 @@ using namespace llvm;
 namespace {
 
 // Complex types used in this pass
-typedef std::pair<BasicBlock *, Value *> StackEntry;
-typedef SmallVector<StackEntry, 16> StackVector;
+using StackEntry = std::pair<BasicBlock *, Value *>;
+using StackVector = SmallVector<StackEntry, 16>;
 
 class SIAnnotateControlFlow : public FunctionPass {
   DivergenceAnalysis *DA;
@@ -76,8 +93,10 @@ class SIAnnotateControlFlow : public FunctionPass {
 
   void insertElse(BranchInst *Term);
 
-  Value *handleLoopCondition(Value *Cond, PHINode *Broken,
-                             llvm::Loop *L, BranchInst *Term);
+  Value *
+  handleLoopCondition(Value *Cond, PHINode *Broken, llvm::Loop *L,
+                      BranchInst *Term,
+                      SmallVectorImpl<WeakTrackingVH> &LoopPhiConditions);
 
   void handleLoop(BranchInst *Term);
 
@@ -86,8 +105,7 @@ class SIAnnotateControlFlow : public FunctionPass {
 public:
   static char ID;
 
-  SIAnnotateControlFlow():
-    FunctionPass(ID) { }
+  SIAnnotateControlFlow() : FunctionPass(ID) {}
 
   bool doInitialization(Module &M) override;
 
@@ -102,7 +120,6 @@ public:
     AU.addPreserved<DominatorTreeWrapperPass>();
     FunctionPass::getAnalysisUsage(AU);
   }
-
 };
 
 } // end anonymous namespace
@@ -123,7 +140,7 @@ bool SIAnnotateControlFlow::doInitialization(Module &M) {
   Void = Type::getVoidTy(Context);
   Boolean = Type::getInt1Ty(Context);
   Int64 = Type::getInt64Ty(Context);
-  ReturnStruct = StructType::get(Boolean, Int64, (Type *)nullptr);
+  ReturnStruct = StructType::get(Boolean, Int64);
 
   BoolTrue = ConstantInt::getTrue(Context);
   BoolFalse = ConstantInt::getFalse(Context);
@@ -183,8 +200,9 @@ bool SIAnnotateControlFlow::isElse(PHINode *Phi) {
 
 // \brief Erase "Phi" if it is not used any more
 void SIAnnotateControlFlow::eraseIfUnused(PHINode *Phi) {
-  if (!Phi->hasNUsesOrMore(1))
-    Phi->eraseFromParent();
+  if (RecursivelyDeleteDeadPHINode(Phi)) {
+    DEBUG(dbgs() << "Erased unused condition phi\n");
+  }
 }
 
 /// \brief Open a new "If" block
@@ -208,9 +226,9 @@ void SIAnnotateControlFlow::insertElse(BranchInst *Term) {
 }
 
 /// \brief Recursively handle the condition leading to a loop
-Value *SIAnnotateControlFlow::handleLoopCondition(Value *Cond, PHINode *Broken,
-                                             llvm::Loop *L, BranchInst *Term) {
-
+Value *SIAnnotateControlFlow::handleLoopCondition(
+    Value *Cond, PHINode *Broken, llvm::Loop *L, BranchInst *Term,
+    SmallVectorImpl<WeakTrackingVH> &LoopPhiConditions) {
   // Only search through PHI nodes which are inside the loop.  If we try this
   // with PHI nodes that are outside of the loop, we end up inserting new PHI
   // nodes outside of the loop which depend on values defined inside the loop.
@@ -218,7 +236,6 @@ Value *SIAnnotateControlFlow::handleLoopCondition(Value *Cond, PHINode *Broken,
   // 'Instruction does not dominate all users!' errors.
   PHINode *Phi = nullptr;
   if ((Phi = dyn_cast<PHINode>(Cond)) && L->contains(Phi)) {
-
     BasicBlock *Parent = Phi->getParent();
     PHINode *NewPhi = PHINode::Create(Int64, 0, "loop.phi", &Parent->front());
     Value *Ret = NewPhi;
@@ -233,14 +250,14 @@ Value *SIAnnotateControlFlow::handleLoopCondition(Value *Cond, PHINode *Broken,
       }
 
       Phi->setIncomingValue(i, BoolFalse);
-      Value *PhiArg = handleLoopCondition(Incoming, Broken, L, Term);
+      Value *PhiArg = handleLoopCondition(Incoming, Broken, L,
+                                          Term, LoopPhiConditions);
       NewPhi->addIncoming(PhiArg, From);
     }
 
     BasicBlock *IDom = DT->getNode(Parent)->getIDom()->getBlock();
 
     for (unsigned i = 0, e = Phi->getNumIncomingValues(); i != e; ++i) {
-
       Value *Incoming = Phi->getIncomingValue(i);
       if (Incoming != BoolTrue)
         continue;
@@ -276,7 +293,7 @@ Value *SIAnnotateControlFlow::handleLoopCondition(Value *Cond, PHINode *Broken,
       NewPhi->setIncomingValue(i, PhiArg);
     }
 
-    eraseIfUnused(Phi);
+    LoopPhiConditions.push_back(WeakTrackingVH(Phi));
     return Ret;
   }
 
@@ -318,14 +335,21 @@ void SIAnnotateControlFlow::handleLoop(BranchInst *Term) {
   BasicBlock *Target = Term->getSuccessor(1);
   PHINode *Broken = PHINode::Create(Int64, 0, "phi.broken", &Target->front());
 
+  SmallVector<WeakTrackingVH, 8> LoopPhiConditions;
   Value *Cond = Term->getCondition();
   Term->setCondition(BoolTrue);
-  Value *Arg = handleLoopCondition(Cond, Broken, L, Term);
+  Value *Arg = handleLoopCondition(Cond, Broken, L, Term, LoopPhiConditions);
 
   for (BasicBlock *Pred : predecessors(Target))
     Broken->addIncoming(Pred == BB ? Arg : Int64Zero, Pred);
 
   Term->setCondition(CallInst::Create(Loop, Arg, "", Term));
+
+  for (WeakTrackingVH Val : llvm::reverse(LoopPhiConditions)) {
+    if (PHINode *Cond = cast_or_null<PHINode>(Val))
+      eraseIfUnused(Cond);
+  }
+
   push(Term->getSuccessor(0), Arg);
 }
 
@@ -348,7 +372,7 @@ void SIAnnotateControlFlow::closeControlFlow(BasicBlock *BB) {
         Preds.push_back(Pred);
     }
 
-    BB = llvm::SplitBlockPredecessors(BB, Preds, "endcf.split", DT, LI, false);
+    BB = SplitBlockPredecessors(BB, Preds, "endcf.split", DT, LI, false);
   }
 
   Value *Exec = popSaved();

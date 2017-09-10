@@ -177,7 +177,7 @@ public:
    */
   void setMaxCacheSizeRelativeToAvailableSpace(unsigned Percentage) {
     if (Percentage)
-      CacheOptions.Policy.PercentageOfAvailableSpace = Percentage;
+      CacheOptions.Policy.MaxSizePercentageOfAvailableSpace = Percentage;
   }
 
   /**@}*/
@@ -204,6 +204,10 @@ public:
   void setTargetOptions(TargetOptions Options) {
     TMBuilder.Options = std::move(Options);
   }
+
+  /// Enable the Freestanding mode: indicate that the optimizer should not
+  /// assume builtins are present on the target.
+  void setFreestanding(bool Enabled) { Freestanding = Enabled; }
 
   /// CodeModel
   void setCodePICModel(Optional<Reloc::Model> Model) {
@@ -321,6 +325,10 @@ private:
   /// Flag to indicate that only the CodeGen will be performed, no cross-module
   /// importing or optimization.
   bool CodeGenOnly = false;
+
+  /// Flag to indicate that the optimizer should not assume builtins are present
+  /// on the target.
+  bool Freestanding = false;
 
   /// IR Optimization Level [0-3].
   unsigned OptLevel = 3;

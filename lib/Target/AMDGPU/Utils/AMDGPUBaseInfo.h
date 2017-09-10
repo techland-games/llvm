@@ -10,6 +10,7 @@
 #ifndef LLVM_LIB_TARGET_AMDGPU_UTILS_AMDGPUBASEINFO_H
 #define LLVM_LIB_TARGET_AMDGPU_UTILS_AMDGPUBASEINFO_H
 
+#include "AMDGPU.h"
 #include "AMDKernelCodeT.h"
 #include "SIDefines.h"
 #include "llvm/ADT/StringRef.h"
@@ -20,12 +21,9 @@
 #include <cstdint>
 #include <utility>
 
-#define GET_INSTRINFO_OPERAND_ENUM
-#include "AMDGPUGenInstrInfo.inc"
-#undef GET_INSTRINFO_OPERAND_ENUM
-
 namespace llvm {
 
+class Argument;
 class FeatureBitset;
 class Function;
 class GlobalValue;
@@ -152,17 +150,10 @@ int16_t getNamedOperandIdx(uint16_t Opcode, uint16_t NamedIdx);
 
 void initDefaultAMDKernelCodeT(amd_kernel_code_t &Header,
                                const FeatureBitset &Features);
-MCSection *getHSATextSection(MCContext &Ctx);
 
-MCSection *getHSADataGlobalAgentSection(MCContext &Ctx);
-
-MCSection *getHSADataGlobalProgramSection(MCContext &Ctx);
-
-MCSection *getHSARodataReadonlyAgentSection(MCContext &Ctx);
-
-bool isGroupSegment(const GlobalValue *GV);
-bool isGlobalSegment(const GlobalValue *GV);
-bool isReadOnlySegment(const GlobalValue *GV);
+bool isGroupSegment(const GlobalValue *GV, AMDGPUAS AS);
+bool isGlobalSegment(const GlobalValue *GV, AMDGPUAS AS);
+bool isReadOnlySegment(const GlobalValue *GV, AMDGPUAS AS);
 
 /// \returns True if constants should be emitted to .text section for given
 /// target triple \p TT, false otherwise.
@@ -252,12 +243,37 @@ unsigned encodeWaitcnt(const IsaInfo::IsaVersion &Version,
 
 unsigned getInitialPSInputAddr(const Function &F);
 
-bool isShader(CallingConv::ID cc);
-bool isCompute(CallingConv::ID cc);
+LLVM_READNONE
+bool isShader(CallingConv::ID CC);
+
+LLVM_READNONE
+bool isCompute(CallingConv::ID CC);
+
+LLVM_READNONE
+bool isEntryFunctionCC(CallingConv::ID CC);
+
+// FIXME: Remove this when calling conventions cleaned up
+LLVM_READNONE
+inline bool isKernel(CallingConv::ID CC) {
+  switch (CC) {
+  case CallingConv::AMDGPU_KERNEL:
+  case CallingConv::SPIR_KERNEL:
+    return true;
+  default:
+    return false;
+  }
+}
 
 bool isSI(const MCSubtargetInfo &STI);
 bool isCI(const MCSubtargetInfo &STI);
 bool isVI(const MCSubtargetInfo &STI);
+bool isGFX9(const MCSubtargetInfo &STI);
+
+/// \brief Is Reg - scalar register
+bool isSGPR(unsigned Reg, const MCRegisterInfo* TRI);
+
+/// \brief Is there any intersection between registers
+bool isRegIntersect(unsigned Reg0, unsigned Reg1, const MCRegisterInfo* TRI);
 
 /// If \p Reg is a pseudo reg, return the correct hardware register given
 /// \p STI otherwise return \p Reg.
@@ -332,6 +348,7 @@ bool isInlinableLiteral16(int16_t Literal, bool HasInv2Pi);
 LLVM_READNONE
 bool isInlinableLiteralV216(int32_t Literal, bool HasInv2Pi);
 
+bool isArgPassedInSGPR(const Argument *Arg);
 bool isUniformMMO(const MachineMemOperand *MMO);
 
 /// \returns The encoding that will be used for \p ByteOffset in the SMRD
